@@ -25,6 +25,9 @@ enum Zone : unsigned {
     kSubmitIndex,  // submit: expanding and remapping the indices of merged runs (inside kSubmit)
     kSubmitDraw,   // submit: draw_run - program, textures, uniforms, attributes, glDrawElements
     kRingUpload,   // cached batch -> GPU ring streaming upload (inside submit)
+    kProgBuild,    // emitting, compiling (or loading from the shader cache) and linking programs (inside kSubmit)
+    kSubmitMesh,   // submit: draws from the object-space mesh cache (inside kSubmit)
+    kSubmitPrep,   // submit: everything before the draw loop - frame mapping, vertex publish, leading copies
     kZoneCount
 };
 
@@ -61,6 +64,8 @@ enum Counter : unsigned {
     kGpuXfVerts,     // DL cache vertices drawn with the GPU transform (no CPU vertex work)
     kGpuXfCopied,    // vertices copied into the DL cache's GPU copy
     kGpuXfSyncs,     // GPU waits forced by those copies
+    kLitUploads,     // GPU lighting uniform sets re-uploaded (a program drawing with new light state)
+    kXfUploads,      // GPU transform uniform sets re-uploaded (a program drawing a new epoch)
     kCounterCount
 };
 

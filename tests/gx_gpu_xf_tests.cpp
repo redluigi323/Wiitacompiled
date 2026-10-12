@@ -242,7 +242,7 @@ bool test_emit() {
     lit.diff_fn[0] = DfClamp;
     static char buf[32768];
     std::size_t n = 0;
-    if (!emit_tev_vertex_cg_xf(needs, lit, buf, sizeof(buf), &n) || n == 0) {
+    if (!emit_tev_vertex_cg_xf(needs, lit, true, buf, sizeof(buf), &n) || n == 0) {
         std::fprintf(stderr, "gpu_xf: emit failed\n");
         return false;
     }
@@ -254,6 +254,16 @@ bool test_emit() {
             std::fprintf(stderr, "gpu_xf: program lacks '%s'\n%s\n", w, buf);
             return false;
         }
+    }
+    if (std::strstr(buf, "uPn[r") != nullptr || std::strstr(buf, "uNm[r") != nullptr) {
+        std::fprintf(stderr, "gpu_xf: program indexes a uniform array with a variable\n%s\n", buf);
+        return false;
+    }
+    static char one[32768];
+    if (!emit_tev_vertex_cg_xf(needs, lit, false, one, sizeof(one), &n) || std::strstr(one, "uniform float4 uPn[3]") == nullptr ||
+        std::strstr(one, "aMtx") != nullptr) {
+        std::fprintf(stderr, "gpu_xf: one-matrix program wrong\n%s\n", one);
+        return false;
     }
     if (std::strstr(buf, "uTgS1") != nullptr || std::strstr(buf, "vColor1") != nullptr) {
         std::fprintf(stderr, "gpu_xf: program declares unused parts\n%s\n", buf);
@@ -523,6 +533,38 @@ bool test_gpu_copy_sync() {
     }
     std::printf("gpu copy: churn %u frames waited (at most %u a frame), %u before the first wrap\n", frames_with_sync,
                 max_per_frame, before_wrap_syncs);
+    // The race pattern: most entries drawn every frame, a few DL primitives whose bytes change every
+    // frame (refilled at a new place each time). Copies land on slots nothing has drawn for a long
+    // time, so they must not wait - static71 waited on nearly every frame here.
+    dl_cache_install(pool.data(), pool_bytes);
+    dl_cache_install_gpu(gpu.data(), &gpu_sync);
+    const unsigned race_syncs0 = g_syncs;
+    unsigned refill_frames = 0;
+    for (int f = 0; f < 1200 && ok; ++f) {
+        DlCacheRef r{};
+        for (unsigned i = 0; i < 10; ++i) {
+            dl_cache_lookup(0x80200000u + i * 64u, 0x99, 1000, 0x7 + i, &r);  // steady
+        }
+        for (unsigned i = 0; i < 4; ++i) {
+            dl_cache_lookup(0x80300000u + i * 64u, 0x99, 60, 0x1000u + static_cast<unsigned>(f), &r);  // changes
+        }
+        dl_cache_batch_begin();
+        for (unsigned i = 0; i < 10; ++i) {
+            if (dl_cache_lookup(0x80200000u + i * 64u, 0x99, 1000, 0x7 + i, &r) == kDlHit) dl_cache_gpu_vertices(r, 1000);
+        }
+        for (unsigned i = 0; i < 4; ++i) {
+            if (dl_cache_lookup(0x80300000u + i * 64u, 0x99, 60, 0x1000u + static_cast<unsigned>(f), &r) == kDlHit) {
+                dl_cache_gpu_vertices(r, 60);
+                ++refill_frames;
+            }
+        }
+        dl_cache_batch_begin();
+        dl_cache_frame_mark();
+    }
+    const unsigned race_syncs = g_syncs - race_syncs0;
+    std::printf("gpu copy: steady + per-frame refills, %u waits in 1200 frames (%u refilled draws)\n", race_syncs,
+                refill_frames);
+    ok = ok && race_syncs <= 6u && refill_frames > 0;  // only when the ring laps the steady entries
     dl_cache_install(nullptr, 0);
     return ok && before_wrap_syncs == 0 && max_per_frame <= 1u && frames_with_sync > 0;
 }

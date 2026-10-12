@@ -711,8 +711,8 @@ bool emit_tev_vertex_cg_lit(const ShaderNeeds& needs, const GpuLitParams& lit, c
     return w.ok;
 }
 
-bool emit_tev_vertex_cg_xf(const ShaderNeeds& needs, const GpuLitParams& lit, char* out, std::size_t cap,
-                           std::size_t* written) {
+bool emit_tev_vertex_cg_xf(const ShaderNeeds& needs, const GpuLitParams& lit, bool skinned, char* out,
+                           std::size_t cap, std::size_t* written) {
     if (!out || cap < 8) {
         return false;
     }
@@ -736,9 +736,11 @@ bool emit_tev_vertex_cg_xf(const ShaderNeeds& needs, const GpuLitParams& lit, ch
         params.add("float4 aColor0");
         params.add("float4 aColor1");
     }
-    params.add("float4 aMtx");
-    params.add("uniform float4 uPn[%u]", kMaxPnMtx * 3u);
-    params.add("uniform float4 uNm[%u]", kMaxPnMtx * 3u);
+    if (skinned) {
+        params.add("float4 aMtx");
+    }
+    params.add("uniform float4 uPn[%u]", skinned ? kMaxPnMtx * 3u : 3u);
+    params.add("uniform float4 uNm[%u]", skinned ? kMaxPnMtx * 3u : 3u);
     params.add("uniform float4 uProj[4]");
     params.add("uniform float4 uXf");
     for (unsigned c = 0; c < kEmitTexCoordSets; ++c) {
@@ -769,11 +771,31 @@ bool emit_tev_vertex_cg_xf(const ShaderNeeds& needs, const GpuLitParams& lit, ch
     w.append(params.text);
     w.append(")\n{\n");
     // decode.cpp gpu_xf_reference is this, in C++.
-    w.append("    float mi = uXf.y > 0.5 ? aMtx.x : uXf.x;\n");
-    w.line("    if (mi > %u.5) mi = 0.0;", kMaxPnMtx - 1u);
-    w.append("    int r = (int)(mi + 0.25) * 3;\n");
+    // The position (and normal) matrix. Uniform arrays are only ever indexed with constants: a
+    // per-vertex index into a uniform array (relative addressing) mis-rendered in Vita3K (static71)
+    // and is the riskiest thing to hand the shader compiler. A skinned layout selects its matrix
+    // with a chain of compares instead; any other has its one matrix in slot 0.
+    w.append("    float4 p0 = uPn[0], p1 = uPn[1], p2 = uPn[2];\n");
+    const bool nrm_needed = used != 0;
+    if (nrm_needed) {
+        w.append("    float4 n0 = uNm[0], n1 = uNm[1], n2 = uNm[2];\n");
+    }
+    if (skinned) {
+        w.append("    float mi = aMtx.x;\n");
+        w.line("    if (mi < %u.5) {", kMaxPnMtx - 1u);  // 10 and up use matrix 0, as on the CPU
+        for (unsigned k = 1; k < kMaxPnMtx; ++k) {
+            if (nrm_needed) {
+                w.line("        if (mi > %u.5) { p0 = uPn[%u]; p1 = uPn[%u]; p2 = uPn[%u]; n0 = uNm[%u]; n1 = uNm[%u]; n2 = uNm[%u]; }",
+                       k - 1u, k * 3u, k * 3u + 1u, k * 3u + 2u, k * 3u, k * 3u + 1u, k * 3u + 2u);
+            } else {
+                w.line("        if (mi > %u.5) { p0 = uPn[%u]; p1 = uPn[%u]; p2 = uPn[%u]; }", k - 1u, k * 3u, k * 3u + 1u,
+                       k * 3u + 2u);
+            }
+        }
+        w.append("    }\n");
+    }
     w.append("    float4 obj = float4(aPosition, 1.0);\n");
-    w.append("    float3 aEyePos = float3(dot(uPn[r], obj), dot(uPn[r + 1], obj), dot(uPn[r + 2], obj));\n");
+    w.append("    float3 aEyePos = float3(dot(p0, obj), dot(p1, obj), dot(p2, obj));\n");
     w.append("    float4 eye = float4(aEyePos, 1.0);\n");
     w.append("    float cx = dot(uProj[0], eye);\n");
     w.append("    float cy = dot(uProj[1], eye);\n");
@@ -785,7 +807,7 @@ bool emit_tev_vertex_cg_xf(const ShaderNeeds& needs, const GpuLitParams& lit, ch
     }
     if (used != 0) {
         w.append("    float4 nobj = float4(aNormal, 0.0);\n");
-        w.append("    float3 aEyeNrm = float3(dot(uNm[r], nobj), dot(uNm[r + 1], nobj), dot(uNm[r + 2], nobj));\n");
+        w.append("    float3 aEyeNrm = float3(dot(n0, nobj), dot(n1, nobj), dot(n2, nobj));\n");
     }
     if (c0 || c1) {
         // The colours the lighting reads: COLOR0 if the layout has it, else COLOR1, else white;
@@ -797,8 +819,10 @@ bool emit_tev_vertex_cg_xf(const ShaderNeeds& needs, const GpuLitParams& lit, ch
     for (unsigned c = 0; c < kEmitTexCoordSets; ++c) {
         if (!needs.coord_used[c]) continue;
         w.line("    {");
-        w.line("        float4 s = float4(aPosition, 1.0) * uTgS%u.x + float4(aNormal, 1.0) * uTgS%u.y +", c, c);
-        w.line("                   float4(aTc0, 1.0, 1.0) * uTgS%u.z + float4(aTc1, 1.0, 1.0) * uTgS%u.w;", c, c);
+        // Selected, not weighted: a NaN or infinity in an attribute the texgen does not read must
+        // not leak into it (0 * NaN is NaN).
+        w.line("        float4 s = uTgS%u.x > 0.5 ? float4(aPosition, 1.0) : (uTgS%u.y > 0.5 ? float4(aNormal, 1.0) :", c, c);
+        w.line("                   (uTgS%u.z > 0.5 ? float4(aTc0, 1.0, 1.0) : float4(aTc1, 1.0, 1.0)));", c);
         w.line("        if (uTgF%u.x > 0.5) s.z = 1.0;", c);
         w.line("        float3 t = float3(dot(uTgM%u[0], s), dot(uTgM%u[1], s), dot(uTgM%u[2], s));", c, c, c);
         w.line("        if (uTgF%u.y > 0.5) { float l = dot(t, t); if (l >= 1.0e-20) t = t * rsqrt(l); }", c);

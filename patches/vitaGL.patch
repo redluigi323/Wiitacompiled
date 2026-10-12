@@ -1,3 +1,40 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index 6edebc4..8656b7b 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -657,12 +657,26 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
+ #endif
+ 	shark_clear_output();
+ #ifdef HAVE_SHADER_CACHE
+-	SceUID f = sceIoOpen(cache_fname, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
+-	size_t sz;
+-	void *buf = serialize_shader(NULL, &sz, s, save_bindings);
+-	sceIoWrite(f, buf, sz);
+-	sceIoClose(f);
+-	vgl_free(buf);
++	// Only a shader that compiled goes to the disk cache: serialize_shader reads s->prog, and a
++	// cached failure would come back as a "hit" on every later run.
++	// Written under a temporary name and renamed once complete, so a run that dies mid-write
++	// never leaves a truncated .gxp behind for the next run to load.
++	if (s->prog) {
++		char tmp_fname[272];
++		sprintf(tmp_fname, "%s.tmp", cache_fname);
++		SceUID f = sceIoOpen(tmp_fname, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
++		if (f >= 0) {
++			size_t sz;
++			void *buf = serialize_shader(NULL, &sz, s, save_bindings);
++			const int written = sceIoWrite(f, buf, sz);
++			sceIoClose(f);
++			vgl_free(buf);
++			if (written == (int)sz)
++				sceIoRename(tmp_fname, cache_fname);
++			else
++				sceIoRemove(tmp_fname);
++		}
++	}
+ #endif
+ }
+ 
 diff --git a/source/framebuffers.c b/source/framebuffers.c
 index 15e59ea..5950c85 100644
 --- a/source/framebuffers.c

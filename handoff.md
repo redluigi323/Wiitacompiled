@@ -6,8 +6,12 @@ goes now. [BUILD.md](BUILD.md) covers building and installing.
 
 ## State
 
-- **Real hardware:** boots, plays menus and races, grand prix included. Races run at about 14–20 fps,
-  and grand prix runs lower until you reach 1st. Light menus hit 60. 3D-heavy menus are well below that.
+- **Real hardware:** boots, plays menus and races, grand prix included. On static72 (`perf_turbo`) 3D
+  menus run at about 22 fps and races at about 12. Grand prix runs lower until you reach 1st. Light
+  menus hit 60. Vita3K draws some geometry wrong with the GPU transform; the real Vita does not.
+- **Loading:** the first time a scene appears its shaders are compiled on the Vita (a race start used to
+  take 30–40 s of it). From static73 vitaGL keeps them in `ux0:data/shader_cache/MKWV00001/`, so only
+  the first visit pays. Deleting that folder is safe; it just costs the first-run compile again.
 - **Rendering:** correct apart from some small glitches. Depth of field is off in races, as it is upstream.
 - **Saves:** go through the NAND HLE (details below).
 - **Target:** 60 fps. That is not reachable with the current guest CPU cost (see "Where the time goes").
@@ -109,9 +113,15 @@ and EFB copies. The backend is GLES 2 on vitaGL. The main files are `vita/src/gx
   - The DL cache already gives each primitive a stable identity. The static52 mesh cache failed
     because finding that identity cost more than the transform; here it is free.
   - The GPU copy (`dl_cache_install_gpu`) mirrors the pool slot for slot, in uncached GPU-mapped
-    memory. An entry is copied the first time it is drawn this way. A copy that would overwrite the
-    previous lap's vertices allocated within the last 3 frames waits for the GPU first (`gsync=`,
-    at most once a frame, and only after the ring has wrapped).
+    memory. An entry is copied the first time it is drawn this way. Every slot remembers the frame
+    it was last drawn in; a copy waits for the GPU (`gsync=`) only when it would overwrite vertices
+    drawn in the last 3 frames. (static71 waited whenever the entry had been allocated in the last 3
+    frames; the race refills a few DL primitives every frame, so that was a `glFinish` nearly every
+    frame once the ring had wrapped.)
+  - Uniform arrays are only indexed with constants. static71 indexed the matrix palette with the
+    per-vertex matrix index and rendered broken geometry in Vita3K (the same program is correct on
+    a conforming GLSL implementation, see Tests). Layouts with a matrix index get a program that
+    selects the matrix with a chain of compares; others put their one matrix in slot 0.
   - Everything not per vertex is one `GpuXfParams` record per state epoch (`draw_state.hpp`):
     matrices, projection, colour selection and texgen. Texgen is uniform-driven: source weights,
     2x4/3x4/SRTG/identity as 3x4 rows, the dual-tex post matrix, normalize, the zero-q fold and SU
@@ -211,6 +221,9 @@ dropped").
   It carries:
   - **`PERF` every ~2 s:**
     - Frame timing: fps, frame/worst ms, guest/decode/submit/copy/swap/render/rwait.
+    - Submit breakdown: `sub: idx= draw= mesh= prep=` (ms), `uup=lit/xf` (lighting and transform
+      uniform sets re-uploaded), and `prog= pbuild=` (programs built and ms spent building them;
+      with a warm shader cache `pbuild` should be small even on a scene's first frame).
     - Draw counts: draws, GL draws, vertices, `vfast`/`glit`.
     - Caches and buffers: `dl:` cache hits, `gxf=` vertices drawn with the GPU transform (`gcopy=`
       copied into its GPU copy, `gsync=` waits for it), `ring=`/`rsync=`, `vpool=`.
@@ -221,6 +234,8 @@ dropped").
     and sound threads. It only sees functions entered through dispatch: anything called statically is
     counted in its caller.
   - **`HPROF`**, the host-PC sampler (`no_hprof` turns it off). It sees inside statically called code.
+  - `perf_turbo` turns both profilers off unless the `prof` marker exists too. Profile with
+    `perf_turbo` + `prof` when that is the configuration being played.
     Symbolise it with `scripts/symbolize-vita-profile.py watchdog.log --elf build-vita/vita/wiicompiled-vita`,
     using the ELF from the same build.
   - **`STUCK`** lines when a guest mutex or the guest lock is held for 2 s, naming owner and waiter.
@@ -241,11 +256,11 @@ optimisation:
 | group | markers |
 | --- | --- |
 | quality / speed | `perf_turbo`, `efb_low`, `efb_lower`, `fx_low`, `fx_off`, `frameskip`, `frameskip2`, `race_dof` |
-| renderer A/B | `no_gpu_xf`, `exact_tev`, `cpu_lighting`, `no_dl_cache`, `no_vbo_ring`, `direct_vertex_ring`, `no_prepared_texgen`, `no_merge`, `no_vertex_reuse`, `no_shaders` |
+| renderer A/B | `no_gpu_xf`, `xf_no_skin`, `xf_no_lit`, `xf_no_texgen` (keep skinned / lit / texgen'd epochs off the GPU transform), `exact_tev`, `cpu_lighting`, `no_dl_cache`, `no_vbo_ring`, `direct_vertex_ring`, `no_prepared_texgen`, `no_merge`, `no_vertex_reuse`, `no_shaders` |
 | threading | `no_render_thread`, `render_nosync`, `render_sync`, `no_vsync`, `no_vertex_worker`, `one_vertex_worker`, `workers_low`, `no_early_handoff`, `no_snd_thread`, `snd_share` |
 | audio | `no_audio`, `reverb`, `mix_inline`, `snd_voice_cap`, `snd_voice_cap_low` |
 | game code | `no_native_engine` |
-| diagnostics | `no_prof`, `no_hprof`, `heap_check`, `capture_now`, `race_sheet` |
+| diagnostics | `prof` (profilers on under `perf_turbo`), `no_prof`, `no_hprof`, `heap_check`, `capture_now`, `race_sheet` |
 
 When comparing two runs, change one marker and keep the same race and camera.
 
@@ -271,7 +286,20 @@ These are worth knowing so they don't get tried again without a new reason:
 
 ## Where the time goes, and what's next
 
-Last full real-hardware race profile:
+Real Vita, static72 with `perf_turbo` (no profile in that log):
+
+| scene | frame | render thread | of which decode | of which submit | GL draws |
+| --- | --- | --- | --- | --- | --- |
+| 3D menu | ~45 ms | ~45 ms | ~27 ms | ~16 ms | ~236 |
+| race | ~80–85 ms | ~80 ms | ~40 ms | ~38 ms (draw ~27) | ~700 |
+
+The game thread spends most of a race frame waiting for the renderer (`rwait` ~35 ms of ~48), so
+the render thread is the limit. Decode and submit run back to back on it. Next steps, in order:
+symbolised HPROF of the render thread (what makes decode cost ~15 µs per GX draw with almost no
+vertex work left), fewer or cheaper GL draws (~38 µs each now: one per state epoch on the GPU
+transform), then decoding on another core while the render thread submits.
+
+Older real-hardware race profile (before the GPU transform):
 
 | thread | CPU per frame |
 | --- | --- |
@@ -312,5 +340,11 @@ paired-single vector type.
 **NEON paths** are checked by cross-compiling the gx tests for Cortex-A9 and running them under
 `qemu-arm`. There is no script in the repo for this: use `arm-linux-gnueabihf-g++` with
 `-mcpu=cortex-a9 -mfpu=neon -fno-pie`.
+
+**GPU transform programs on a real GLSL implementation:** `tools/gpu_xf_check/`. The host build's
+`mkwv_gpu_xf_cases N` writes random cases (program, uniforms, vertices, C++ reference outputs);
+`run_cases.py` converts each Cg program to GLSL with NVIDIA's `cgc`, runs it with transform
+feedback (Mesa llvmpipe through EGL is enough) and compares every output. It needs `cgc` and
+Python's `moderngl`, so it is not part of ctest. Run it after any change to `emit_tev_vertex_cg_xf`.
 
 **Known failure:** `translated_isa_tests` (its NAND fixture isn't in the repo).

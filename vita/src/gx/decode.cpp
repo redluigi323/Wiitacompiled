@@ -1559,6 +1559,22 @@ bool gpu_xf_eligible(const State& state, const VertexDecoder& decoder) {
         state.num_tex_gens > kMaxTexGens) {
         return false;
     }
+    // Diagnostic limits (markers xf_no_skin, xf_no_lit, xf_no_texgen): narrow down a rendering
+    // problem to one part of the transform program without a rebuild.
+    const unsigned limits = gpu_xf_limits();
+    if ((limits & kGpuXfNoSkin) && decoder.has_pn_idx()) {
+        return false;
+    }
+    if ((limits & kGpuXfNoTexgen) && state.num_tex_gens != 0) {
+        return false;
+    }
+    if (limits & kGpuXfNoLit) {
+        for (unsigned c = 0; c < 4u; ++c) {
+            if (state.chans[c].lighting) {
+                return false;
+            }
+        }
+    }
     for (unsigned i = 0; i < state.num_tex_gens; ++i) {
         const TexGen& gen = state.texgens[i];
         if (gen.type != TgMtx2x4 && gen.type != TgMtx3x4 && gen.type != TgSrtg) {
@@ -1696,11 +1712,14 @@ void gpu_xf_reference(const GpuXfParams& p, const CachedVertex& v, float clip[4]
     *raw1 = (has0 && has1) ? v.color1 : white;
     for (unsigned i = 0; i < kMaxTexGens; ++i) {
         const float* w = p.tg_src[i];
-        float s[4];
-        s[0] = v.x * w[0] + v.nx * w[1] + v.tc[0][0] * w[2] + v.tc[1][0] * w[3];
-        s[1] = v.y * w[0] + v.ny * w[1] + v.tc[0][1] * w[2] + v.tc[1][1] * w[3];
-        s[2] = v.z * w[0] + v.nz * w[1] + w[2] + w[3];
-        s[3] = w[0] + w[1] + w[2] + w[3];
+        float s[4] = {v.tc[1][0], v.tc[1][1], 1.0f, 1.0f};
+        if (w[0] > 0.5f) {
+            s[0] = v.x; s[1] = v.y; s[2] = v.z;
+        } else if (w[1] > 0.5f) {
+            s[0] = v.nx; s[1] = v.ny; s[2] = v.nz;
+        } else if (w[2] > 0.5f) {
+            s[0] = v.tc[0][0]; s[1] = v.tc[0][1];
+        }
         if (p.tg_flags[i][0] > 0.5f) {
             s[2] = 1.0f;
         }

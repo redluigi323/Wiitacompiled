@@ -57,8 +57,10 @@ bool emit_tev_vertex_cg_lit(const ShaderNeeds& needs, const GpuLitParams& lit, c
 // CachedVertex records in model space (aPosition, aNormal, aTc0, aTc1, aColor0, aColor1, aMtx);
 // the matrices, texgen and colour selection are uniforms (uPn, uNm, uProj, uXf, per used
 // texcoord c uTgS/M/P/F/K c), and the lighting is the GPU-lit program's.
-bool emit_tev_vertex_cg_xf(const ShaderNeeds& needs, const GpuLitParams& lit, char* out, std::size_t cap,
-                           std::size_t* written);
+// `skinned`: the layout has a per-vertex matrix index (aMtx, ten matrices); otherwise the one
+// matrix sits in slot 0 of uPn/uNm.
+bool emit_tev_vertex_cg_xf(const ShaderNeeds& needs, const GpuLitParams& lit, bool skinned, char* out,
+                           std::size_t cap, std::size_t* written);
 // Fragment program: evaluates the programmed TEV stages the way GX does (Aurora
 // lib/gx/shader.cpp). Register values (konst, TEV colour registers, fog) arrive as uniforms;
 // structure - including the alpha-compare references, which Aurora also bakes - is in the

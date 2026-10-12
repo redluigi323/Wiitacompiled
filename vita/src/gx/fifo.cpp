@@ -3036,6 +3036,16 @@ void set_gpu_xf(bool on) {
     g_gpu_xf = on;
 }
 
+unsigned g_gpu_xf_limits = 0;
+
+void set_gpu_xf_limits(unsigned limits) {
+    g_gpu_xf_limits = limits;
+}
+
+unsigned gpu_xf_limits() {
+    return g_gpu_xf_limits;
+}
+
 bool gpu_xf_enabled() {
     return g_gpu_xf;
 }

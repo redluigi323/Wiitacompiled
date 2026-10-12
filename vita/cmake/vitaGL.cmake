@@ -59,6 +59,11 @@ target_compile_definitions(mkwv_vitagl PRIVATE
   # No per-call GL argument validation (vitaGL's NO_DEBUG). The renderer never relies on GL
   # errors to work; this is pure per-call overhead on thousands of calls a frame.
   SKIP_ERROR_HANDLING
+  # static73: vitaGL's on-disk shader cache. Every compiled Cg shader is kept as a .gxp under
+  # ux0:data/shader_cache/MKWV00001/, keyed by a hash of its source, and later runs load it
+  # instead of running SceShaccCg again (a TEV shader takes a good part of a second to compile on
+  # a real Vita, and a race start used to compile a couple of hundred of them).
+  HAVE_SHADER_CACHE
   VGL_GIT_HASH="mkwv"
 )
 target_compile_options(mkwv_vitagl PRIVATE

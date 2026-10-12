@@ -1968,6 +1968,9 @@ struct TevProgram {
     bool samplers_set = false;
     GLuint mesh_prog = 0;
     bool mesh_failed = false;
+    // static73: a slot made for the mesh path only. Its main program (never used by mesh draws)
+    // is built the first time a normal draw asks for it.
+    bool main_pending = false;
     GLint ma_pos = -1, ma_nrm = -1, ma_uv = -1, ma_uv1 = -1, ma_col = -1;
     GLint mu_pn = -1, mu_proj = -1, mu_nrm = -1, mu_tex = -1, mu_col1 = -1, mu_lit = -1, mu_src = -1;
     GLint mu_mat = -1, mu_amb = -1, mu_lpos = -1, mu_ldir = -1, mu_lcol = -1, mu_cos = -1, mu_dist = -1;
@@ -2144,7 +2147,11 @@ void clear_copy_channels(const EfbCopyEvent& e, int gx, int gy, int gw, int gh) 
     glDisable(GL_SCISSOR_TEST);
 }
 
-TevProgram* find_or_build_program(const State& st, const GpuLitParams* lit = nullptr, bool xf = false) {
+bool build_main_program(TevProgram& slot, const State& st, const GpuLitParams* lit, bool xf, bool skinned);
+
+// want_main = false (the mesh path) finds or makes the slot without building its main program.
+TevProgram* find_or_build_program(const State& st, const GpuLitParams* lit = nullptr, bool xf = false,
+                                  bool skinned = false, bool want_main = true) {
     std::uint64_t key = hash_tev_program(st);
     if (lit != nullptr) {
         key ^= lit_structure_key(*lit) * 0x100000001B3ull;
@@ -2153,22 +2160,33 @@ TevProgram* find_or_build_program(const State& st, const GpuLitParams* lit = nul
         if (lit == nullptr) {
             return nullptr;  // the transform program always does the lighting too
         }
-        key ^= 0x7866787866787631ull;  // "xfxfxfv1"
+        key ^= skinned ? 0x786678786b696e32ull : 0x7866787866787632ull;  // "xfxfkin2" / "xfxfxfv2"
     }
     ++g_program_clock;
     // Direct-mapped front for the linear table (hundreds of programs, a lookup per GL draw).
     static TevProgram* s_front[256] = {};
     TevProgram*& front = s_front[(key ^ (key >> 29)) & 255u];
+    TevProgram* found = nullptr;
     if (front != nullptr && front->used && front->key == key) {
-        front->last_used = g_program_clock;
-        return front->failed ? nullptr : front;
-    }
-    for (unsigned i = 0; i < g_program_count; ++i) {
-        if (g_programs[i].used && g_programs[i].key == key) {
-            g_programs[i].last_used = g_program_clock;
-            front = &g_programs[i];
-            return g_programs[i].failed ? nullptr : &g_programs[i];
+        found = front;
+    } else {
+        for (unsigned i = 0; i < g_program_count; ++i) {
+            if (g_programs[i].used && g_programs[i].key == key) {
+                found = &g_programs[i];
+                front = found;
+                break;
+            }
         }
+    }
+    if (found != nullptr) {
+        found->last_used = g_program_clock;
+        if (want_main && found->main_pending && !found->failed) {
+            found->main_pending = false;
+            if (!build_main_program(*found, st, lit, xf, skinned)) {
+                found->failed = true;
+            }
+        }
+        return found->failed ? nullptr : found;
     }
     unsigned slot_index = g_program_count;
     if (g_program_count >= kMaxPrograms) {
@@ -2193,31 +2211,45 @@ TevProgram* find_or_build_program(const State& st, const GpuLitParams* lit = nul
     slot = TevProgram{};
     slot.key = key;
     slot.used = true;
-    slot.failed = true;  // cleared only once everything below succeeds
     slot.last_used = g_program_clock;
     slot.needs = analyze_tev(st);
+    front = &slot;
+    if (!want_main) {
+        slot.failed = false;
+        slot.main_pending = true;
+        return &slot;
+    }
+    slot.failed = !build_main_program(slot, st, lit, xf, skinned);
+    return slot.failed ? nullptr : &slot;
+}
+
+// Emits, compiles and links the slot's TEV program (slot.key and slot.needs are set). False
+// leaves the slot without a program; the caller marks it failed.
+bool build_main_program(TevProgram& slot, const State& st, const GpuLitParams* lit, bool xf, bool skinned) {
+    perf::Scope timing(perf::kProgBuild);
+    perf::count(perf::kPrograms);
     ++g_dbg.progmake;
 
     static char vsrc[32768];
     static char fsrc[65536];
     std::size_t nv = 0, nf = 0;
-    const bool vs_ok = xf               ? emit_tev_vertex_cg_xf(slot.needs, *lit, vsrc, sizeof(vsrc), &nv)
+    const bool vs_ok = xf               ? emit_tev_vertex_cg_xf(slot.needs, *lit, skinned, vsrc, sizeof(vsrc), &nv)
                        : lit != nullptr ? emit_tev_vertex_cg_lit(slot.needs, *lit, vsrc, sizeof(vsrc), &nv)
                                         : emit_tev_vertex_cg(slot.needs, vsrc, sizeof(vsrc), &nv);
     if (!vs_ok || !emit_tev_fragment_cg(st, fsrc, sizeof(fsrc), &nf)) {
         g_dbg.proglast = 1;  // the emitter refused or overflowed its buffer
-        return nullptr;
+        return false;
     }
     const GLuint vs = compile_cg(GL_CG_VERTEX_SHADER_EXT, vsrc);
     if (vs == 0) {
         g_dbg.proglast = 2;
-        return nullptr;
+        return false;
     }
     const GLuint fs = compile_cg(GL_CG_FRAGMENT_SHADER_EXT, fsrc);
     if (fs == 0) {
         glDeleteShader(vs);
         g_dbg.proglast = 3;
-        return nullptr;
+        return false;
     }
     const GLuint prog = glCreateProgram();
     glAttachShader(prog, vs);
@@ -2230,7 +2262,7 @@ TevProgram* find_or_build_program(const State& st, const GpuLitParams* lit = nul
     if (linked == 0) {
         glDeleteProgram(prog);
         g_dbg.proglast = 4;
-        return nullptr;
+        return false;
     }
     slot.prog = prog;
     slot.a_pos = glGetAttribLocation(prog, "aPosition");
@@ -2273,7 +2305,7 @@ TevProgram* find_or_build_program(const State& st, const GpuLitParams* lit = nul
         glDeleteProgram(prog);
         slot.prog = 0;
         g_dbg.proglast = 5;
-        return nullptr;
+        return false;
     }
     for (unsigned t = 0; t < kMaxTexMaps; ++t) {
         slot.u_tex[t] = -1;
@@ -2310,8 +2342,7 @@ TevProgram* find_or_build_program(const State& st, const GpuLitParams* lit = nul
             }
         }
     }
-    slot.failed = false;
-    return &slot;
+    return true;
 }
 
 void unpack_to_float4(std::uint32_t c, GLfloat* out) {
@@ -2406,6 +2437,7 @@ void set_uniform2f_cached(TevProgram& p, unsigned slot, GLint loc, GLfloat a, GL
 bool draw_xf_attributes(TevProgram& p, const GpuXfParams& xp, const std::uint16_t* idx, std::uint32_t nidx,
                         const std::uint8_t* vbase) {
     if (p.xf_serial != xp.serial) {
+        perf::count(perf::kXfUploads);
         const GLsizei nm = static_cast<GLsizei>(xp.num_pn) * 3;
         if (p.xu_pn >= 0) glUniform4fv(p.xu_pn, nm, &xp.pn[0][0]);
         if (p.xu_nm >= 0) glUniform4fv(p.xu_nm, nm, &xp.nrm[0][0]);
@@ -2452,7 +2484,7 @@ bool draw_with_program(const Processor& processor, const DrawCall& draw, const D
     const State& st = tev_state_for(processor, draw, x);
     const GpuLitParams* lit = g_cur_lit;
     const GpuXfParams* xfp = g_cur_xf;
-    TevProgram* pp = find_or_build_program(st, lit, xfp != nullptr);
+    TevProgram* pp = find_or_build_program(st, lit, xfp != nullptr, xfp != nullptr && xfp->num_pn > 1);
     if (pp == nullptr) {
         if (xfp != nullptr) {
             // The transform program does not build: later epochs go back to the vertex jobs.
@@ -2475,6 +2507,7 @@ bool draw_with_program(const Processor& processor, const DrawCall& draw, const D
     TevProgram& p = *pp;
     c_use_program(p.prog);
     if (lit != nullptr && (!p.ulit_valid || std::memcmp(&p.ulit, lit, sizeof(GpuLitParams)) != 0)) {
+        perf::count(perf::kLitUploads);
         for (unsigned c = 0; c < 2u; ++c) {
             if (p.u_mat[c] >= 0) glUniform4fv(p.u_mat[c], 1, lit->mat[c]);
             if (p.u_amb[c] >= 0) glUniform4fv(p.u_amb[c], 1, lit->amb[c]);
@@ -3005,6 +3038,8 @@ bool ensure_mesh_program(TevProgram& p, const State& st) {
     if (p.mesh_failed) {
         return false;
     }
+    perf::Scope timing(perf::kProgBuild);
+    perf::count(perf::kPrograms);
     static char vsrc[16384];
     static char fsrc[65536];
     std::size_t nf = 0;
@@ -3107,7 +3142,7 @@ void bytes255(std::uint32_t c, GLfloat* o) {
 bool draw_mesh_program(const Processor& processor, const DrawCall& draw, const DrawExtra* x, const GpuMeshView& mesh,
                        GLfloat dst_alpha_mix) {
     const State& st = tev_state_for(processor, draw, x);
-    TevProgram* pp = find_or_build_program(st);
+    TevProgram* pp = find_or_build_program(st, nullptr, false, false, /*want_main=*/false);
     if (pp == nullptr || !ensure_mesh_program(*pp, st)) {
         return false;
     }
@@ -3317,6 +3352,7 @@ bool draw_mesh_run(const Processor& processor, const DrawCall& draw, const DrawE
 // them. The first batch of a frame fixes the letterbox; later batches (a Processor that
 // filled up mid-frame) reuse it.
 bool submit_processor(const Processor& processor) {
+    const std::uint64_t prep_t0 = perf::now_us();
     const bool first_batch = !g_frame_open;
     if (first_batch) {
         g_dbg = {};
@@ -3394,6 +3430,7 @@ bool submit_processor(const Processor& processor) {
         apply_raster(processor.state, pf0);  // the clear touched scissor and masks
     }
     perf::count(perf::kDraws, processor.draw_count);
+    perf::add(perf::kSubmitPrep, perf::now_us() - prep_t0);
     for (std::uint32_t d = 0; d < processor.draw_count;) {
         const DrawCall& draw = processor.draws[d];
         // A copy recorded before draw d observes draws [0, d) - GX's own ordering.
@@ -3426,6 +3463,7 @@ bool submit_processor(const Processor& processor) {
             continue;
         }
         if (const GpuMeshView* mesh = gpu_mesh_view(d)) {
+            perf::Scope mesh_timing(perf::kSubmitMesh);
             if (draw_mesh_run(processor, draw, x, *mesh)) {
                 ++g_dbg.issued;
             } else {
@@ -3816,9 +3854,9 @@ void set_gpu_xf_buffer(unsigned vbo, const std::uint8_t* base, std::uint32_t byt
 }
 
 bool gpu_xf_probe() {
-    // One transform program built and linked the way find_or_build_program does it, before any
-    // game frame: if the shader compiler refuses the indexed matrix palette, the GPU transform
-    // stays off instead of losing geometry later.
+    // Both transform programs (one matrix, and the skinned ten-matrix palette) built and linked
+    // the way find_or_build_program does it, before any game frame: if the shader compiler refuses
+    // them the GPU transform stays off instead of losing geometry later.
     static State st;
     st.reset();
     st.num_tex_gens = 2;
@@ -3833,25 +3871,33 @@ bool gpu_xf_probe() {
     static char vsrc[32768];
     static char fsrc[65536];
     std::size_t nv = 0, nf = 0;
-    if (!emit_tev_vertex_cg_xf(needs, lit, vsrc, sizeof(vsrc), &nv) || !emit_tev_fragment_cg(st, fsrc, sizeof(fsrc), &nf)) {
+    if (!emit_tev_fragment_cg(st, fsrc, sizeof(fsrc), &nf)) {
         return false;
     }
-    const GLuint vs = compile_cg(GL_CG_VERTEX_SHADER_EXT, vsrc);
-    const GLuint fs = vs != 0 ? compile_cg(GL_CG_FRAGMENT_SHADER_EXT, fsrc) : 0;
-    bool ok = false;
-    if (vs != 0 && fs != 0) {
-        const GLuint prog = glCreateProgram();
-        glAttachShader(prog, vs);
-        glAttachShader(prog, fs);
-        glLinkProgram(prog);
-        GLint linked = 0;
-        glGetProgramiv(prog, GL_LINK_STATUS, &linked);
-        ok = linked != 0 && glGetAttribLocation(prog, "aPosition") >= 0;
-        glDeleteProgram(prog);
+    for (int skinned = 0; skinned <= 1; ++skinned) {
+        if (!emit_tev_vertex_cg_xf(needs, lit, skinned != 0, vsrc, sizeof(vsrc), &nv)) {
+            return false;
+        }
+        const GLuint vs = compile_cg(GL_CG_VERTEX_SHADER_EXT, vsrc);
+        const GLuint fs = vs != 0 ? compile_cg(GL_CG_FRAGMENT_SHADER_EXT, fsrc) : 0;
+        bool ok = false;
+        if (vs != 0 && fs != 0) {
+            const GLuint prog = glCreateProgram();
+            glAttachShader(prog, vs);
+            glAttachShader(prog, fs);
+            glLinkProgram(prog);
+            GLint linked = 0;
+            glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+            ok = linked != 0 && glGetAttribLocation(prog, "aPosition") >= 0;
+            glDeleteProgram(prog);
+        }
+        if (vs != 0) glDeleteShader(vs);
+        if (fs != 0) glDeleteShader(fs);
+        if (!ok) {
+            return false;
+        }
     }
-    if (vs != 0) glDeleteShader(vs);
-    if (fs != 0) glDeleteShader(fs);
-    return ok;
+    return true;
 }
 
 void set_effects_level(int level) { g_effects_level = level < 0 ? 0 : (level > 2 ? 2 : level); }

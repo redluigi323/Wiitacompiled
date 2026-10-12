@@ -136,11 +136,16 @@ copy them over with VitaShell's FTP or USB mode, then install the VPK and launch
 
 the port writes `ux0:data/viicompiled/boot.log` (startup) and `ux0:data/viicompiled/watchdog.log` (per-second perf lines, profiler samples, hangs). attach both to an issue, and say which commit you built. crash dumps in `ux0:data/` can be read with `scripts/parse-vita-core.sh` against `build-vita/vita/wiicompiled-vita`, the unstripped ELF from the same build.
 
+## first-run loading
+
+the first time any scene shows up, its shaders get compiled on the Vita, which is slow (a race start can sit there for half a minute). they're kept in `ux0:data/shader_cache/MKWV00001/` afterwards, so the next time is much quicker. deleting that folder is harmless, it just brings back the slow first run.
+
 ## toggles
 
-behaviour can be switched by creating empty files in `ux0:data/viicompiled/` and restarting. the one worth knowing about:
+behaviour can be switched by creating empty files in `ux0:data/viicompiled/` and restarting. the ones worth knowing about:
 
 - `perf_turbo` renders at 0.75 resolution, turns effects off and lowers the sound budget. it looks worse but runs faster.
+- `prof` keeps the profilers on when `perf_turbo` is set (it normally turns them off). use it when you're sending a log for a slow scene.
 
 the rest are mostly A/B switches for testing a single optimization. [handoff.md](handoff.md) lists all of them.
 

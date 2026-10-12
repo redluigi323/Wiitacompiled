@@ -21,10 +21,16 @@ patch_dep() { # dir patch
   local dir="$1" patch="$2"
   if git -C "${dir}" apply --reverse --check "${patch}" 2>/dev/null; then
     echo "  $(basename "${patch}") already applied"
-  else
-    git -C "${dir}" apply "${patch}"
-    echo "  applied $(basename "${patch}")"
+    return
   fi
+  if ! git -C "${dir}" apply --check "${patch}" 2>/dev/null && ! git -C "${dir}" diff --quiet; then
+    # An older version of the patch is applied (the patch grew since this checkout was made).
+    # The pinned dependency carries no other local changes, so start it from clean.
+    echo "  $(basename "${dir}") has an older patch applied; resetting it to the pinned commit"
+    git -C "${dir}" checkout -q -- .
+  fi
+  git -C "${dir}" apply "${patch}"
+  echo "  applied $(basename "${patch}")"
 }
 
 fetch "${root}/upstream"             https://github.com/patchzyy/Wiicompiled.git       7e6604c4157d3a6f937d1a03ac9818fd85bba0a9

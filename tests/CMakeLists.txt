@@ -89,6 +89,9 @@ add_test(NAME mkwv_gx_gpu_lit_tests COMMAND mkwv_gx_gpu_lit_tests)
 add_executable(mkwv_gx_gpu_xf_tests gx_gpu_xf_tests.cpp)
 target_link_libraries(mkwv_gx_gpu_xf_tests PRIVATE mkwv::gx Threads::Threads)
 add_test(NAME mkwv_gx_gpu_xf_tests COMMAND mkwv_gx_gpu_xf_tests)
+# Not a test: writes the cases tools/gpu_xf_check/run_cases.py runs on a real GLSL implementation.
+add_executable(mkwv_gpu_xf_cases "${CMAKE_SOURCE_DIR}/tools/gpu_xf_check/gen_cases.cpp")
+target_link_libraries(mkwv_gpu_xf_cases PRIVATE mkwv::gx)
 
 add_executable(mkwv_gx_dl_cache_tests gx_dl_cache_tests.cpp)
 target_link_libraries(mkwv_gx_dl_cache_tests PRIVATE mkwv::gx Threads::Threads)

@@ -1738,7 +1738,7 @@ const char* rel_boot_debug() {
     const std::uint32_t system = Memory::Read32(0x80385FC8u);
     const std::uint32_t sm = system != 0 ? Memory::Read32(system + 84u) : 0u;
     std::snprintf(line, sizeof(line),
-                  "mkwv: REL rev=static71-gpuxf phase=%s links=%u done=%u input_samples=%u buttons=%08X module=%08X entry=%08X creator=%08X next=%08X\n",
+                  "mkwv: REL rev=static73-loads phase=%s links=%u done=%u input_samples=%u buttons=%08X module=%08X entry=%08X creator=%08X next=%08X\n",
                   g_rel_phase.load(), g_rel_link_calls.load(), g_rel_prolog_done ? 1u : 0u, g_strap_input_samples.load(),
                   g_strap_buttons.load(), g_rel_module.load(), g_rel_module.load() != 0 ? Memory::Read32(g_rel_module.load() + 52u) : 0u, sm != 0 ? Memory::Read32(sm + 44u) : 0u,
                   sm != 0 ? Memory::Read32(sm + 20u) : 0u);

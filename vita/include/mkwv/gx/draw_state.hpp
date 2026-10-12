@@ -76,6 +76,10 @@ void fill_gpu_xf_params(const State& state, const VertexDecoder& decoder, const 
                         GpuXfParams& out);
 void set_gpu_xf(bool on);
 bool gpu_xf_enabled();
+// Diagnostic limits on what the GPU transform takes (main.cpp markers).
+enum GpuXfLimit : unsigned { kGpuXfNoSkin = 1, kGpuXfNoLit = 2, kGpuXfNoTexgen = 4 };
+void set_gpu_xf_limits(unsigned limits);
+unsigned gpu_xf_limits();
 // Draw `index` of `processor`'s batch, when it is drawn with the GPU transform: its parameters
 // and its first vertex in the DL cache's GPU copy. False for every other draw.
 struct GpuXfDraw {

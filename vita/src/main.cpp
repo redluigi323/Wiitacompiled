@@ -98,6 +98,9 @@ int main() {
     const mkwv::platform::Clocks clocks = mkwv::platform::apply_performance_clocks();
     // Explicit quality-for-throughput preset. Keep real game/render frames (no frame skip).
     const bool perf_turbo = marker_present("perf_turbo");
+    // static73: perf_turbo used to switch both profilers off. `prof` keeps them on with it, so a
+    // profiled run measures the same configuration that is actually played.
+    const bool profilers = (!perf_turbo || marker_present("prof"));
     mkwv::runtime::set_native_engine(!marker_present("no_native_engine"));
     mkwv::gx::set_prepared_texgen(!marker_present("no_prepared_texgen"));
 
@@ -117,7 +120,7 @@ int main() {
     // The object-space mesh cache stays off. static52 served the menu from it and the
     // lookup (a 512KB fingerprint per draw) cost more than the CPU transform it replaced.
     // Guest sampling profiler (PROF lines in the watchdog log); no_prof turns it off.
-    if (!perf_turbo && !marker_present("no_prof")) {
+    if (profilers && !marker_present("no_prof")) {
         mkwv::runtime::prof::register_sampled_thread();  // this thread runs the game
         mkwv::platform::start_guest_profiler();
     }
@@ -143,6 +146,9 @@ int main() {
     // no_gpu_xf turns it off (it also needs the DL cache and GPU lighting).
     mkwv::gx::set_gpu_xf(!marker_present("no_gpu_xf") && !marker_present("cpu_lighting") &&
                          !marker_present("no_dl_cache"));
+    mkwv::gx::set_gpu_xf_limits((marker_present("xf_no_skin") ? mkwv::gx::kGpuXfNoSkin : 0u) |
+                                (marker_present("xf_no_lit") ? mkwv::gx::kGpuXfNoLit : 0u) |
+                                (marker_present("xf_no_texgen") ? mkwv::gx::kGpuXfNoTexgen : 0u));
     // static64: display-list vertex cache (decoded model-space vertices kept across frames) and
     // the GPU vertex ring (vertex jobs pack straight into memory the GPU draws from; vitaGL
     // stops copying every draw's vertices). no_dl_cache / no_vbo_ring turn them off.
@@ -176,8 +182,11 @@ int main() {
         sceIoClose(boot_reset);
     }
     g_boot_log = std::fopen(mkwv::platform::kBootLog, "w");
-    boot_log("mkwv: static71-gpuxf perf_turbo=%d native_engine=%d forced_inline=0\n", perf_turbo ? 1 : 0, mkwv::runtime::native_engine_enabled() ? 1 : 0);
+    boot_log("mkwv: static73-loads perf_turbo=%d profilers=%d native_engine=%d forced_inline=0\n", perf_turbo ? 1 : 0, profilers ? 1 : 0, mkwv::runtime::native_engine_enabled() ? 1 : 0);
     boot_log("mkwv: gpu mesh cache %s\n", mkwv::gx::gpu_mesh_active() ? "on" : "off");
+    // static73: compiled shaders are kept by vitaGL (HAVE_SHADER_CACHE); the first run of a scene
+    // still compiles, later runs load. Deleting the folder only costs that first-run time again.
+    boot_log("mkwv: shader disk cache ux0:data/shader_cache/<titleid>/ (vitaGL)\n");
     boot_log("mkwv: lighting on the %s\n", mkwv::gx::gpu_lighting_enabled() ? "GPU" : "CPU");
     boot_log("mkwv: prepared texgen %s\n", mkwv::gx::prepared_texgen_enabled() ? "on" : "off");
     boot_log("mkwv: dl vertex cache %s, gpu vertex ring %s, gpu transform %s\n", marker_present("no_dl_cache") ? "off" : "on",
@@ -316,7 +325,7 @@ int main() {
         mkwv::runtime::set_render_handoff_threshold(0);
     }
     boot_log("mkwv: vitaGL GLES ready\n");
-    boot_log("mkwv: GPU transform %s\n", mkwv::gx::gpu_xf_enabled() ? "on" : "off");
+    boot_log("mkwv: GPU transform %s (limits %u)\n", mkwv::gx::gpu_xf_enabled() ? "on" : "off", mkwv::gx::gpu_xf_limits());
     log_free_memory("after vitaGL");
     g_gx = gx.get();
     runtime.set_present(present_guest);
@@ -352,7 +361,7 @@ int main() {
         }
     }
     // static65: host-PC sampling of the game, render, worker and sound threads (HPROF lines).
-    if (!perf_turbo && !marker_present("no_hprof")) {
+    if (profilers && !marker_present("no_hprof")) {
         boot_log("mkwv: host profiler %s\n", mkwv::platform::start_host_profiler() ? "on" : "unavailable");
     }
     sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);

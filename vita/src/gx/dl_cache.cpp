@@ -3,6 +3,7 @@
 #include "mkwv/gx/perf.hpp"
 
 #include <cstring>
+#include <new>
 
 namespace mkwv::gx {
 namespace {
@@ -25,6 +26,7 @@ struct Entry {
     bool used = false;
     bool volatile_data = false;  // its arrays changed under it once: never cached again
     bool on_gpu = false;         // copied into the GPU ring since it was (re)filled
+    std::uint32_t drawn = 0;     // frame its GPU copy was last drawn in
 };
 
 Entry g_table[kSlots];
@@ -35,15 +37,16 @@ bool g_enabled = true;
 std::uint32_t g_serial = 1;
 DlCacheStats g_stats;
 
-// GPU copy. Its slots are the pool's: an entry's vertices sit at the same index in both. A
-// copy overwrites whatever the previous lap of the ring left at that index, which the GPU may
-// still be drawing if that data was valid recently - that is, if this entry was allocated (which
-// is when the old data stopped being valid) after the start of frame N-3. Then the copy waits for
-// the GPU first; once per frame at most, since after a wait everything allocated so far is safe.
+// GPU copy. Its slots are the pool's: an entry's vertices sit at the same index in both. A copy
+// overwrites whatever an older entry left at those indices; the GPU may still be drawing that
+// data if it was drawn in the last 3 frames. Every vertex slot remembers the frame it was last
+// drawn in, so a copy waits for the GPU exactly when it would overwrite such vertices (static71
+// waited whenever an entry had been allocated in the last 3 frames: with a few DL primitives
+// refilled every frame that was a glFinish nearly every race frame).
 CachedVertex* g_gpu = nullptr;
 void (*g_gpu_sync)() = nullptr;
-std::uint64_t g_head_at_frame[4] = {};  // g_head when each of the last four frames began
-std::uint32_t g_frame = 0;
+std::uint32_t* g_drawn = nullptr;  // per vertex slot: frame it was last drawn from (0 = never)
+std::uint32_t g_frame = 1;
 std::uint32_t g_gpu_syncs = 0;
 std::uint32_t g_gpu_copied = 0;
 
@@ -75,6 +78,7 @@ bool allocate(Entry& e, std::uint32_t count) {
     e.ready = g_serial;
     e.hits = 0;
     e.on_gpu = false;
+    e.drawn = 0;
     return true;
 }
 
@@ -120,15 +124,20 @@ void dl_cache_install(void* pool, std::uint32_t bytes) {
 void dl_cache_install_gpu(void* base, void (*gpu_sync)()) {
     g_gpu = nullptr;
     g_gpu_sync = gpu_sync;
+    delete[] g_drawn;
+    g_drawn = nullptr;
     for (Entry& e : g_table) {
         e.on_gpu = false;
-    }
-    for (auto& h : g_head_at_frame) {
-        h = g_head;
+        e.drawn = 0;
     }
     if (base == nullptr || g_pool == nullptr) {
         return;
     }
+    g_drawn = new (std::nothrow) std::uint32_t[g_cap];
+    if (g_drawn == nullptr) {
+        return;
+    }
+    std::memset(g_drawn, 0, sizeof(std::uint32_t) * g_cap);
     g_gpu = static_cast<CachedVertex*>(base);
 }
 
@@ -154,12 +163,17 @@ std::uint32_t dl_cache_gpu_vertices(const DlCacheRef& ref, std::uint32_t count) 
         return ~0u;
     }
     if (!e.on_gpu) {
-        const std::uint64_t oldest = g_head_at_frame[(g_frame + 1u) & 3u];  // start of frame N-3
-        if (e.pos >= g_cap && e.pos + count > oldest && g_gpu_sync != nullptr) {
+        bool recent = false;
+        for (std::uint32_t i = first; i < first + count; ++i) {
+            const std::uint32_t f = g_drawn[i];
+            recent = recent || (f != 0 && f + 3u >= g_frame);
+        }
+        if (recent && g_gpu_sync != nullptr) {
             g_gpu_sync();
             ++g_gpu_syncs;
-            for (auto& h : g_head_at_frame) {
-                h = g_head;  // everything allocated so far has been waited for
+            std::memset(g_drawn, 0, sizeof(std::uint32_t) * g_cap);  // everything drawn so far is done
+            for (Entry& t : g_table) {
+                t.drawn = 0;
             }
         }
         std::memcpy(g_gpu + first, g_pool + first, sizeof(CachedVertex) * count);
@@ -169,13 +183,19 @@ std::uint32_t dl_cache_gpu_vertices(const DlCacheRef& ref, std::uint32_t count) 
         e.on_gpu = true;
         g_gpu_copied += count;
     }
+    if (e.drawn != g_frame) {
+        e.drawn = g_frame;  // once per entry and frame
+        for (std::uint32_t i = first; i < first + count; ++i) {
+            g_drawn[i] = g_frame;
+        }
+    }
     return first;
 }
 
 void dl_cache_frame_mark() {
     ++g_frame;
-    g_head_at_frame[g_frame & 3u] = g_head;
 }
+
 std::uint32_t dl_cache_take_gpu_syncs() {
     const std::uint32_t n = g_gpu_syncs;
     g_gpu_syncs = 0;
