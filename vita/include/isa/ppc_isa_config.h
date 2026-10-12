@@ -19,11 +19,18 @@ inline constexpr bool MkwStateFreeAbiEnabled(uint32_t) noexcept
 #define MKW_PPC_NO_INLINE __declspec(noinline)
 #define MKW_PPC_INTERNAL_CALL __regcall
 #else
-#define MKW_PPC_FORCE_INLINE __attribute__((always_inline)) inline
+// Vita: no forced inlining anywhere in the translated code. Upstream marks the ISA helpers and
+// some translated bodies always_inline; forced inlining in the shards cost compile time and code
+// size without measurable FPS here, so these are plain `inline` and GCC's -O2 heuristics decide.
+#define MKW_PPC_FORCE_INLINE inline
 #define MKW_PPC_NO_INLINE __attribute__((noinline))
 #define MKW_PPC_INTERNAL_CALL
 #endif
+#if defined(_WIN32)
 #define MKW_PPC_ALWAYS_INLINE_BODY __attribute__((always_inline))
+#else
+#define MKW_PPC_ALWAYS_INLINE_BODY
+#endif
 #define MKW_PPC_COLD __attribute__((cold))
 
 using MkwStateFreeResult2 = struct MkwStateFreeResult2 {

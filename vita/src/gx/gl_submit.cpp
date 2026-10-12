@@ -62,6 +62,7 @@ struct SubmitDebug {
     int depth_test = -1, depth_write = -1, depth_func = -1, cull = -1;
     int gl_err = 0;
     std::uint32_t gathers = 0;    // merged runs whose vertices were not contiguous in the arena
+    std::uint32_t xfruns = 0;     // GL draws issued with the GPU transform (static70)
 };
 
 SubmitDebug g_dbg;
@@ -118,6 +119,11 @@ void use_array_buffer(GLuint b) {
 bool in_ring(const std::uint8_t* p) {
     return g_ring_vbo != 0 && p >= g_ring_base && p < g_ring_base + g_ring_bytes;
 }
+
+// GPU transform (static70): the DL cache's GPU copy, drawn through its own VBO the same way.
+GLuint g_xf_vbo = 0;
+const std::uint8_t* g_xf_base = nullptr;
+std::uint32_t g_xf_bytes = 0;
 bool g_efb_target = false;          // rendering into the EFB target (not the back buffer)
 bool g_efb_clear_pending = false;   // the new frame's clear, deferred past its leading copies
 std::uint32_t g_efb_clear_rgba = 0;
@@ -1976,6 +1982,13 @@ struct TevProgram {
         u_lk[kMaxLights]{};
     bool ulit_valid = false;
     GpuLitParams ulit;
+    // GPU transform programs (emit_tev_vertex_cg_xf): CachedVertex attributes and the
+    // transform/texgen uniforms (index: the texcoord set; S, M, P, F, K).
+    bool xf = false;
+    GLint x_pos = -1, x_nrm = -1, x_tc0 = -1, x_tc1 = -1, x_col0 = -1, x_col1 = -1, x_mtx = -1;
+    GLint xu_pn = -1, xu_nm = -1, xu_proj = -1, xu_misc = -1;
+    GLint xu_tg[kEmitTexCoordSets][5]{};
+    std::uint32_t xf_serial = 0;  // the GpuXfParams last uploaded
 };
 
 // The lighting structure a GPU-lit vertex program bakes in (values are uniforms).
@@ -1995,6 +2008,9 @@ std::uint64_t lit_structure_key(const GpuLitParams& p) {
 // Set by the submit loop around draw_run: the lighting of the draw being issued, when its
 // vertices were packed for GPU lighting.
 const GpuLitParams* g_cur_lit = nullptr;
+// Likewise the GPU transform parameters, when the run is drawn from the DL cache's GPU copy.
+const GpuXfParams* g_cur_xf = nullptr;
+unsigned g_xf_program_failures = 0;
 unsigned g_lit_program_failures = 0;
 
 TevProgram g_programs[kMaxPrograms];
@@ -2128,10 +2144,16 @@ void clear_copy_channels(const EfbCopyEvent& e, int gx, int gy, int gw, int gh) 
     glDisable(GL_SCISSOR_TEST);
 }
 
-TevProgram* find_or_build_program(const State& st, const GpuLitParams* lit = nullptr) {
+TevProgram* find_or_build_program(const State& st, const GpuLitParams* lit = nullptr, bool xf = false) {
     std::uint64_t key = hash_tev_program(st);
     if (lit != nullptr) {
         key ^= lit_structure_key(*lit) * 0x100000001B3ull;
+    }
+    if (xf) {
+        if (lit == nullptr) {
+            return nullptr;  // the transform program always does the lighting too
+        }
+        key ^= 0x7866787866787631ull;  // "xfxfxfv1"
     }
     ++g_program_clock;
     // Direct-mapped front for the linear table (hundreds of programs, a lookup per GL draw).
@@ -2179,8 +2201,9 @@ TevProgram* find_or_build_program(const State& st, const GpuLitParams* lit = nul
     static char vsrc[32768];
     static char fsrc[65536];
     std::size_t nv = 0, nf = 0;
-    const bool vs_ok = lit != nullptr ? emit_tev_vertex_cg_lit(slot.needs, *lit, vsrc, sizeof(vsrc), &nv)
-                                      : emit_tev_vertex_cg(slot.needs, vsrc, sizeof(vsrc), &nv);
+    const bool vs_ok = xf               ? emit_tev_vertex_cg_xf(slot.needs, *lit, vsrc, sizeof(vsrc), &nv)
+                       : lit != nullptr ? emit_tev_vertex_cg_lit(slot.needs, *lit, vsrc, sizeof(vsrc), &nv)
+                                        : emit_tev_vertex_cg(slot.needs, vsrc, sizeof(vsrc), &nv);
     if (!vs_ok || !emit_tev_fragment_cg(st, fsrc, sizeof(fsrc), &nf)) {
         g_dbg.proglast = 1;  // the emitter refused or overflowed its buffer
         return nullptr;
@@ -2211,12 +2234,37 @@ TevProgram* find_or_build_program(const State& st, const GpuLitParams* lit = nul
     }
     slot.prog = prog;
     slot.a_pos = glGetAttribLocation(prog, "aPosition");
-    slot.a_col0 = slot.needs.color0 ? glGetAttribLocation(prog, "aColor0") : -1;
-    slot.a_col1 = slot.needs.color1 ? glGetAttribLocation(prog, "aColor1") : -1;
+    if (xf) {
+        slot.xf = true;
+        slot.x_pos = slot.a_pos;
+        slot.x_nrm = glGetAttribLocation(prog, "aNormal");
+        slot.x_tc0 = glGetAttribLocation(prog, "aTc0");
+        slot.x_tc1 = glGetAttribLocation(prog, "aTc1");
+        slot.x_col0 = glGetAttribLocation(prog, "aColor0");
+        slot.x_col1 = glGetAttribLocation(prog, "aColor1");
+        slot.x_mtx = glGetAttribLocation(prog, "aMtx");
+        slot.xu_pn = glGetUniformLocation(prog, "uPn");
+        slot.xu_nm = glGetUniformLocation(prog, "uNm");
+        slot.xu_proj = glGetUniformLocation(prog, "uProj");
+        slot.xu_misc = glGetUniformLocation(prog, "uXf");
+        char xname[24];
+        static const char* kTg[5] = {"uTgS", "uTgM", "uTgP", "uTgF", "uTgK"};
+        for (unsigned c = 0; c < kEmitTexCoordSets; ++c) {
+            for (unsigned k = 0; k < 5u; ++k) {
+                slot.xu_tg[c][k] = -1;
+                if (slot.needs.coord_used[c]) {
+                    std::snprintf(xname, sizeof(xname), "%s%u", kTg[k], c);
+                    slot.xu_tg[c][k] = glGetUniformLocation(prog, xname);
+                }
+            }
+        }
+    }
+    slot.a_col0 = (slot.needs.color0 && !xf) ? glGetAttribLocation(prog, "aColor0") : -1;
+    slot.a_col1 = (slot.needs.color1 && !xf) ? glGetAttribLocation(prog, "aColor1") : -1;
     char name[24];
     for (unsigned c = 0; c < kEmitTexCoordSets; ++c) {
         slot.a_tc[c] = -1;
-        if (slot.needs.coord_used[c]) {
+        if (slot.needs.coord_used[c] && !xf) {
             std::snprintf(name, sizeof(name), "aTexcoord%u", c);
             slot.a_tc[c] = glGetAttribLocation(prog, name);
         }
@@ -2353,6 +2401,49 @@ void set_uniform2f_cached(TevProgram& p, unsigned slot, GLint loc, GLfloat a, GL
 
 // Draws `nidx` indices (relative to `vbase`, laid out as g_vlayout) with the draw's compiled
 // TEV program. Returns false to mean "fall back" (no program for this structure).
+// GPU transform: uploads the epoch's matrices and texgen (once per program and record) and draws
+// `nidx` indices relative to `vbase`, a CachedVertex in the DL cache's GPU copy.
+bool draw_xf_attributes(TevProgram& p, const GpuXfParams& xp, const std::uint16_t* idx, std::uint32_t nidx,
+                        const std::uint8_t* vbase) {
+    if (p.xf_serial != xp.serial) {
+        const GLsizei nm = static_cast<GLsizei>(xp.num_pn) * 3;
+        if (p.xu_pn >= 0) glUniform4fv(p.xu_pn, nm, &xp.pn[0][0]);
+        if (p.xu_nm >= 0) glUniform4fv(p.xu_nm, nm, &xp.nrm[0][0]);
+        if (p.xu_proj >= 0) glUniform4fv(p.xu_proj, 4, &xp.proj[0][0]);
+        if (p.xu_misc >= 0) glUniform4fv(p.xu_misc, 1, xp.misc);
+        for (unsigned c = 0; c < kEmitTexCoordSets; ++c) {
+            const GLint* u = p.xu_tg[c];
+            if (u[0] >= 0) glUniform4fv(u[0], 1, xp.tg_src[c]);
+            if (u[1] >= 0) glUniform4fv(u[1], 3, &xp.tg_mtx[c][0][0]);
+            if (u[2] >= 0) glUniform4fv(u[2], 3, &xp.tg_post[c][0][0]);
+            if (u[3] >= 0) glUniform4fv(u[3], 1, xp.tg_flags[c]);
+            if (u[4] >= 0) glUniform4fv(u[4], 1, xp.tg_scale[c]);
+        }
+        p.xf_serial = xp.serial;
+    }
+    use_array_buffer(g_xf_vbo);
+    vglBufferData(GL_ARRAY_BUFFER, vbase);
+    constexpr GLsizei kStride = static_cast<GLsizei>(sizeof(CachedVertex));
+    std::uint32_t want = 0;
+    auto attr = [&want](GLint loc, GLint n, GLenum type, GLboolean norm, std::uintptr_t off) {
+        if (loc >= 0) {
+            want |= 1u << static_cast<unsigned>(loc);
+            glVertexAttribPointer(static_cast<GLuint>(loc), n, type, norm, kStride, reinterpret_cast<const void*>(off));
+        }
+    };
+    attr(p.x_pos, 3, GL_FLOAT, GL_FALSE, offsetof(CachedVertex, x));
+    attr(p.x_nrm, 3, GL_FLOAT, GL_FALSE, offsetof(CachedVertex, nx));
+    attr(p.x_tc0, 2, GL_FLOAT, GL_FALSE, offsetof(CachedVertex, tc));
+    attr(p.x_tc1, 2, GL_FLOAT, GL_FALSE, offsetof(CachedVertex, tc) + 2u * sizeof(float));
+    attr(p.x_col0, 4, GL_UNSIGNED_BYTE, GL_TRUE, offsetof(CachedVertex, color));
+    attr(p.x_col1, 4, GL_UNSIGNED_BYTE, GL_TRUE, offsetof(CachedVertex, color1));
+    attr(p.x_mtx, 4, GL_UNSIGNED_BYTE, GL_FALSE, offsetof(CachedVertex, pn_mtx));
+    c_attribs(want);
+    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(nidx), GL_UNSIGNED_SHORT, idx);
+    perf::count(perf::kGlDraws);
+    return true;
+}
+
 bool draw_with_program(const Processor& processor, const DrawCall& draw, const DrawExtra* x, const std::uint16_t* idx,
                        std::uint32_t nidx, const std::uint8_t* vbase, GLfloat dst_alpha_mix = 1.0f) {
     if (!g_shader_path) {
@@ -2360,8 +2451,17 @@ bool draw_with_program(const Processor& processor, const DrawCall& draw, const D
     }
     const State& st = tev_state_for(processor, draw, x);
     const GpuLitParams* lit = g_cur_lit;
-    TevProgram* pp = find_or_build_program(st, lit);
+    const GpuXfParams* xfp = g_cur_xf;
+    TevProgram* pp = find_or_build_program(st, lit, xfp != nullptr);
     if (pp == nullptr) {
+        if (xfp != nullptr) {
+            // The transform program does not build: later epochs go back to the vertex jobs.
+            if (g_xf_program_failures++ == 0) {
+                std::printf("mkwv: GPU transform program failed (step %d); transform back on the CPU\n", g_dbg.proglast);
+            }
+            set_gpu_xf(false);
+            return false;
+        }
         if (lit != nullptr) {
             // A GPU-lit vertex program that does not build: later state epochs go back to the
             // CPU lighting (this draw's vertices are already packed raw).
@@ -2483,6 +2583,9 @@ bool draw_with_program(const Processor& processor, const DrawCall& draw, const D
     // The fixed-function client-state arrays and generic attribute arrays are different
     // paths in VitaGL; the FFP ones stay off while programs draw.
     c_ffp_arrays(false);
+    if (xfp != nullptr) {
+        return draw_xf_attributes(p, *xfp, idx, nidx, vbase);
+    }
     const VertexLayout& l = g_vlayout;
     const GLsizei stride = static_cast<GLsizei>(l.stride);
     if (in_ring(vbase)) {
@@ -2595,6 +2698,8 @@ bool draw_run(const Processor& processor, const DrawCall& draw, const DrawExtra*
                 apply_depth(processor.state);
             }
         }
+    } else if (g_cur_xf != nullptr) {
+        ++g_dbg.progfail;  // nothing packed to fall back to; later epochs use the vertex jobs
     } else {
         ++g_dbg.progfail;
         c_use_program(0);
@@ -3329,6 +3434,71 @@ bool submit_processor(const Processor& processor) {
             ++d;
             continue;
         }
+        GpuXfDraw xd{};
+        if (g_xf_vbo != 0 && x != nullptr && x->lit.on != 0 && draw_gpu_xf(processor, d, &xd)) {
+            // GPU transform (static70): straight from the DL cache's GPU copy. A run extends over
+            // following draws of the same epoch (one parameter record) and material.
+            const std::uint64_t index_t0 = perf::now_us();
+            std::uint32_t e = d + 1;
+            std::uint32_t lo = xd.first;
+            std::uint32_t hi = xd.first + draw.vertex_count;
+            while (g_merge_draws && e < processor.draw_count) {
+                if (next_copy < copy_count && copies[next_copy].draw_index <= e) {
+                    break;
+                }
+                const DrawCall& n = processor.draws[e];
+                GpuXfDraw nx{};
+                if (n.vertex_count == 0 || !draw_gpu_xf(processor, e, &nx) || nx.params != xd.params ||
+                    !draws_mergeable(draw, n, x, draw_extra(processor, e), draw_merge_key(processor, d),
+                                     draw_merge_key(processor, e))) {
+                    break;
+                }
+                const std::uint32_t nlo = nx.first < lo ? nx.first : lo;
+                const std::uint32_t nhi = nx.first + n.vertex_count > hi ? nx.first + n.vertex_count : hi;
+                if (nhi - nlo > 0x10000u) {
+                    break;
+                }
+                lo = nlo;
+                hi = nhi;
+                ++e;
+            }
+            std::uint32_t nidx = 0;
+            for (std::uint32_t k = d; k < e; ++k) {
+                const DrawCall& dk = processor.draws[k];
+                GpuXfDraw kx{};
+                draw_gpu_xf(processor, k, &kx);
+                const std::uint32_t n = expand_indices(dk.prim, dk.vertex_count, draw_idx, kMaxDecodedVerts * 3);
+                if (n > kMaxDecodedVerts * 3 - nidx) {
+                    e = k;
+                    break;
+                }
+                const std::uint32_t base = kx.first - lo;
+                for (std::uint32_t i = 0; i < n; ++i) {
+                    run_idx[nidx + i] = static_cast<std::uint16_t>(draw_idx[i] + base);
+                }
+                nidx += n;
+            }
+            if (e == d) {
+                e = d + 1;
+            }
+            const std::uint64_t draw_t0 = perf::now_us();
+            perf::add(perf::kSubmitIndex, draw_t0 - index_t0);
+            g_cur_lit = &x->lit;
+            g_cur_xf = xd.params;
+            const bool drew = nidx != 0 && draw_run(processor, draw, x, run_idx, nidx,
+                                                    g_xf_base + static_cast<std::size_t>(lo) * sizeof(CachedVertex));
+            g_cur_xf = nullptr;
+            g_cur_lit = nullptr;
+            perf::add(perf::kSubmitDraw, perf::now_us() - draw_t0);
+            if (drew) {
+                g_dbg.issued += e - d;
+                ++g_dbg.xfruns;
+            } else {
+                g_dbg.skipped += e - d;
+            }
+            d = e;
+            continue;
+        }
         if (d == 0 && first_batch) {
             g_dbg.nidx0 = expanded_index_count(draw.prim, draw.vertex_count);
         }
@@ -3344,7 +3514,9 @@ bool submit_processor(const Processor& processor) {
                 break;
             }
             const DrawCall& n = processor.draws[e];
+            GpuXfDraw nx{};
             if (n.vertex_count == 0 || gpu_mesh_view(e) != nullptr || draw_gpu_lit(processor, e) != draw_gpu_lit(processor, d) ||
+                draw_gpu_xf(processor, e, &nx) ||
                 !draws_mergeable(draw, n, x, draw_extra(processor, e), draw_merge_key(processor, d),
                                  draw_merge_key(processor, e))) {
                 break;
@@ -3637,6 +3809,51 @@ void set_vertex_ring_buffer(unsigned vbo, const std::uint8_t* base, std::uint32_
     g_ring_bytes = bytes;
 }
 
+void set_gpu_xf_buffer(unsigned vbo, const std::uint8_t* base, std::uint32_t bytes) {
+    g_xf_vbo = vbo;
+    g_xf_base = base;
+    g_xf_bytes = bytes;
+}
+
+bool gpu_xf_probe() {
+    // One transform program built and linked the way find_or_build_program does it, before any
+    // game frame: if the shader compiler refuses the indexed matrix palette, the GPU transform
+    // stays off instead of losing geometry later.
+    static State st;
+    st.reset();
+    st.num_tex_gens = 2;
+    st.num_tev_stages = 1;
+    const ShaderNeeds needs = analyze_tev(st);
+    GpuLitParams lit{};
+    lit.on = 1;
+    lit.lit[0] = 1;
+    lit.light_mask[0] = 0x03;
+    lit.diff_fn[0] = DfClamp;
+    lit.attn_fn[0] = AfSpot;
+    static char vsrc[32768];
+    static char fsrc[65536];
+    std::size_t nv = 0, nf = 0;
+    if (!emit_tev_vertex_cg_xf(needs, lit, vsrc, sizeof(vsrc), &nv) || !emit_tev_fragment_cg(st, fsrc, sizeof(fsrc), &nf)) {
+        return false;
+    }
+    const GLuint vs = compile_cg(GL_CG_VERTEX_SHADER_EXT, vsrc);
+    const GLuint fs = vs != 0 ? compile_cg(GL_CG_FRAGMENT_SHADER_EXT, fsrc) : 0;
+    bool ok = false;
+    if (vs != 0 && fs != 0) {
+        const GLuint prog = glCreateProgram();
+        glAttachShader(prog, vs);
+        glAttachShader(prog, fs);
+        glLinkProgram(prog);
+        GLint linked = 0;
+        glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+        ok = linked != 0 && glGetAttribLocation(prog, "aPosition") >= 0;
+        glDeleteProgram(prog);
+    }
+    if (vs != 0) glDeleteShader(vs);
+    if (fs != 0) glDeleteShader(fs);
+    return ok;
+}
+
 void set_effects_level(int level) { g_effects_level = level < 0 ? 0 : (level > 2 ? 2 : level); }
 
 void set_race_probe_sheet(bool enabled) { g_race_probe_sheet = enabled; }
@@ -3669,7 +3886,7 @@ const char* last_submit_debug() {
                   "mkwv: SUBMIT gl draws=%u batches=%u nidx0=%u issued=%u skip=%u comb=%u cfail=%u | prog=%u pfail=%u "
                   "pmake=%u pcount=%u pevict=%u plast=%d efb=%u/%u efbtot(done=%u front=%u orphan=%u hits=%u) rchg=%u "
                   "efbdim=%.0fx%.0f rt=%s disp=%u,%u %ux%u logic=%u dsta=%u | tex dec=%u reval=%u conv=%d bind=%d %ux%u bytes=%u | "
-                  "depth=%d/%d fn=%d cull=%d | glerr=%d cclrfail=%u cfbo=%u/%u | ring=%s gather=%u | tfmt%s\n",
+                  "depth=%d/%d fn=%d cull=%d | glerr=%d cclrfail=%u cfbo=%u/%u | ring=%s gather=%u xf=%s/%u | tfmt%s\n",
                   g_dbg.draws, g_dbg.batches, g_dbg.nidx0, g_dbg.issued, g_dbg.skipped, g_dbg.comb, g_dbg.cfail,
                   g_dbg.prog, g_dbg.progfail, g_dbg.progmake, g_dbg.progcount, g_dbg.progevict, g_dbg.proglast,
                   g_dbg.efbcopy, g_dbg.efbhit, g_efb_total_done, g_efb_total_front, g_efb_total_orphan,
@@ -3678,7 +3895,8 @@ const char* last_submit_debug() {
                   g_dbg.logicop, g_dbg.dstalpha, g_dbg.texdecode, g_dbg.texrevalid, g_dbg.tex_convert, g_dbg.tex_bind, g_dbg.tex_w,
                   g_dbg.tex_h, g_dbg.tex_bytes, g_dbg.depth_test, g_dbg.depth_write, g_dbg.depth_func, g_dbg.cull,
                   g_dbg.gl_err, g_copy_clear_failures, copy_fbos_in_use(), g_copy_fbo_resizes,
-                  g_ring_vbo != 0 ? "on" : "off", g_dbg.gathers, fmt_text);
+                  g_ring_vbo != 0 ? "on" : "off", g_dbg.gathers, (g_xf_vbo != 0 && gpu_xf_enabled()) ? "on" : "off",
+                  g_dbg.xfruns, fmt_text);
     return g_dbg_text;
 }
 

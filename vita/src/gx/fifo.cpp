@@ -150,6 +150,16 @@ bool g_dl_cache_on = true;
 bool g_gpu_lighting = false;
 std::uint8_t g_draw_glit[kMaxDraws];
 
+// GPU transform (draw_state.hpp GpuXfParams): one parameter record per state epoch that has
+// such draws, from a per-batch pool, and per draw its record (-1: none) and first vertex in the
+// DL cache's GPU copy.
+bool g_gpu_xf = false;
+constexpr unsigned kXfRecords = 512;
+GpuXfParams g_xf_records[kXfRecords];
+unsigned g_xf_used = 0;
+std::int16_t g_draw_xf_rec[kMaxDraws];
+std::uint32_t g_draw_xf_first[kMaxDraws];
+
 void snapshot_draw_extra(const State& st, DrawExtra& x) {
     std::memcpy(x.tex, st.texmaps, sizeof(x.tex));
     for (unsigned t = 0; t < kMaxTexMaps; ++t) {
@@ -2550,6 +2560,7 @@ bool Processor::process(const std::uint8_t* data, std::uint32_t size, bool big_e
                     snapshot_draw_extra(state, g_draw_extra[draw_count]);
                     g_draw_extra[draw_count].lit = GpuLitParams{};
                     g_draw_glit[draw_count] = 0;
+                    g_draw_xf_rec[draw_count] = -1;
                     g_draw_extra_slot[draw_count] = static_cast<std::uint16_t>(draw_count);
                     g_draw_key[draw_count] = 0;
                     g_draw_snapshot_epoch = g_reuse_epoch;
@@ -2677,9 +2688,15 @@ bool Processor::process(const std::uint8_t* data, std::uint32_t size, bool big_e
             static PreparedLighting prepared;
             static std::uint64_t lighting_epoch = 0;
             static bool epoch_glit = false;
+            // GPU transform for DL cache hits (static70): eligibility per epoch, its parameter
+            // record made on the epoch's first such draw.
+            static bool epoch_xf = false;
+            static int s_xf_rec = -1;
             if (lighting_epoch != g_reuse_epoch) {
                 prepare_lighting(state, prepared);
                 epoch_glit = gpu_lit_eligible(state, prepared);
+                epoch_xf = gpu_xf_eligible(state, s_decoder);
+                s_xf_rec = -1;
                 lighting_epoch = g_reuse_epoch;
             }
             // Lines and points are expanded in clip space here, from lit vertices: they keep
@@ -2706,16 +2723,6 @@ bool Processor::process(const std::uint8_t* data, std::uint32_t size, bool big_e
             }
             const unsigned ntc = pack_ntc(state.num_tex_gens);
             const std::uint32_t pstride = pack_stride(ntc, glit);
-            bool worker = false;
-            if (!stroke && packets && vtx_count != 0 && vertex_worker_active() &&
-                (s_snap_epoch == g_reuse_epoch || s_epoch_verts > kInlineVerts)) {
-                if (s_snap_epoch != g_reuse_epoch) {
-                    s_snap_id = vertex_worker_snapshot(state, prepared, su_scale, su_any, s_decoder, epoch_glit);
-                    s_snap_epoch = g_reuse_epoch;
-                }
-                worker = true;
-            }
-            bool decoded_ok = true;
             const std::uint8_t* seq = data + pos;
             const std::uint8_t* const prim_end = data + pos + total;
             // Display-list vertex cache (static64, dl_cache.hpp): a DL primitive seen in an earlier
@@ -2742,6 +2749,35 @@ bool Processor::process(const std::uint8_t* data, std::uint32_t size, bool big_e
                     }
                 }
             }
+            // GPU transform (static70): a hit whose epoch the vertex shader can evaluate is drawn
+            // from the DL cache's GPU copy. No vertex job, no packing: only the draw is recorded.
+            bool xf = false;
+            std::uint32_t xf_first = 0;
+            if (draw_count == 0 && s_xf_rec < 0) {
+                g_xf_used = 0;  // a new batch: the previous batch's records were submitted
+            }
+            if (dl_mode == kDlHit && epoch_xf) {
+                if (s_xf_rec < 0) {
+                    if (g_xf_used < kXfRecords) {
+                        fill_gpu_xf_params(state, s_decoder, su_scale, su_any, g_xf_records[g_xf_used]);
+                        s_xf_rec = static_cast<int>(g_xf_used++);
+                    }
+                }
+                if (s_xf_rec >= 0) {
+                    xf_first = dl_cache_gpu_vertices(dl, vtx_count);
+                    xf = xf_first != ~0u;
+                }
+            }
+            bool worker = false;
+            if (!xf && !stroke && packets && vtx_count != 0 && vertex_worker_active() &&
+                (s_snap_epoch == g_reuse_epoch || s_epoch_verts > kInlineVerts)) {
+                if (s_snap_epoch != g_reuse_epoch) {
+                    s_snap_id = vertex_worker_snapshot(state, prepared, su_scale, su_any, s_decoder, epoch_glit);
+                    s_snap_epoch = g_reuse_epoch;
+                }
+                worker = true;
+            }
+            bool decoded_ok = true;
             const bool use_reuse = reuse && dl_mode == kDlNone;
             // One pass per vertex: a vertex whose packet was already processed in this epoch
             // is remapped to it (the renderer's indices point there); any other is decoded,
@@ -2751,12 +2787,12 @@ bool Processor::process(const std::uint8_t* data, std::uint32_t size, bool big_e
                 worker = false;  // a primitive larger than the stash: do it here
             }
             std::uint8_t* const arena = vertex_batch_arena();
-            const std::uint32_t pack_off = stroke ? 0u : vertex_batch_alloc(vert_count, vtx_count, ntc, glit);
+            const std::uint32_t pack_off = (stroke || xf) ? 0u : vertex_batch_alloc(vert_count, vtx_count, ntc, glit);
             if (dl_mode != kDlNone) {
                 for (std::uint32_t i = 0; i < vtx_count; ++i) {
                     vertex_batch_set_remap(vert_count + i, -1);
                 }
-                if (!worker) {
+                if (!worker && !xf) {
                     for (std::uint32_t i = 0; i < vtx_count; ++i) {
                         DecodedVertex& dv = dst[i];
                         if (dl_mode == kDlHit) {
@@ -2843,6 +2879,9 @@ bool Processor::process(const std::uint8_t* data, std::uint32_t size, bool big_e
             }
             perf::count(perf::kVertices, vtx_count);
             perf::count(perf::kReusedVertices, reused);
+            if (xf) {
+                perf::count(perf::kGpuXfVerts, vtx_count);
+            }
             std::uint32_t emitted = vtx_count;
             if (stroke) {
                 float vp_w = 640.0f;
@@ -2873,7 +2912,9 @@ bool Processor::process(const std::uint8_t* data, std::uint32_t size, bool big_e
                 draw.vertex_count = emitted;
                 g_draw_extra_slot[draw_count] = g_draw_extra_slot[draw_count - 1];
                 g_draw_key[draw_count] = g_draw_key[draw_count - 1];
-                g_draw_glit[draw_count] = glit ? 1 : 0;
+                g_draw_glit[draw_count] = (glit && !xf) ? 1 : 0;
+                g_draw_xf_rec[draw_count] = xf ? static_cast<std::int16_t>(s_xf_rec) : static_cast<std::int16_t>(-1);
+                g_draw_xf_first[draw_count] = xf_first;
                 perf::count(perf::kReusedDrawStates);
                 ++draw_count;
                 vert_count += emitted;
@@ -2925,12 +2966,14 @@ bool Processor::process(const std::uint8_t* data, std::uint32_t size, bool big_e
             draw.zcomploc = state.zcomploc;
             g_draw_extra_owner = this;
             snapshot_draw_extra(state, g_draw_extra[draw_count]);
-            if (epoch_glit) {
+            if (epoch_glit || epoch_xf) {
                 fill_gpu_lit_params(state, prepared, g_draw_extra[draw_count].lit);
             } else {
                 g_draw_extra[draw_count].lit = GpuLitParams{};
             }
-            g_draw_glit[draw_count] = glit ? 1 : 0;
+            g_draw_glit[draw_count] = (glit && !xf) ? 1 : 0;
+            g_draw_xf_rec[draw_count] = xf ? static_cast<std::int16_t>(s_xf_rec) : static_cast<std::int16_t>(-1);
+            g_draw_xf_first[draw_count] = xf_first;
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
             // The submission merger compares snapshots bytewise. Uninitialised
             // padding used to split otherwise identical materials into GL calls.
@@ -2987,6 +3030,24 @@ std::uint64_t draw_merge_key(const Processor& processor, std::uint32_t index) {
 
 void set_dl_cache(bool on) {
     g_dl_cache_on = on;
+}
+
+void set_gpu_xf(bool on) {
+    g_gpu_xf = on;
+}
+
+bool gpu_xf_enabled() {
+    return g_gpu_xf;
+}
+
+bool draw_gpu_xf(const Processor& processor, std::uint32_t index, GpuXfDraw* out) {
+    if (g_draw_extra_owner != &processor || index >= processor.draw_count || index >= kMaxDraws ||
+        g_draw_xf_rec[index] < 0 || static_cast<unsigned>(g_draw_xf_rec[index]) >= g_xf_used) {
+        return false;
+    }
+    out->params = &g_xf_records[g_draw_xf_rec[index]];
+    out->first = g_draw_xf_first[index];
+    return true;
 }
 
 bool draw_gpu_lit(const Processor& processor, std::uint32_t index) {

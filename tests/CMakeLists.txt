@@ -86,6 +86,10 @@ add_executable(mkwv_gx_gpu_lit_tests gx_gpu_lit_tests.cpp)
 target_link_libraries(mkwv_gx_gpu_lit_tests PRIVATE mkwv::gx Threads::Threads)
 add_test(NAME mkwv_gx_gpu_lit_tests COMMAND mkwv_gx_gpu_lit_tests)
 
+add_executable(mkwv_gx_gpu_xf_tests gx_gpu_xf_tests.cpp)
+target_link_libraries(mkwv_gx_gpu_xf_tests PRIVATE mkwv::gx Threads::Threads)
+add_test(NAME mkwv_gx_gpu_xf_tests COMMAND mkwv_gx_gpu_xf_tests)
+
 add_executable(mkwv_gx_dl_cache_tests gx_dl_cache_tests.cpp)
 target_link_libraries(mkwv_gx_dl_cache_tests PRIVATE mkwv::gx Threads::Threads)
 add_test(NAME mkwv_gx_dl_cache_tests COMMAND mkwv_gx_dl_cache_tests)

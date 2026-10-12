@@ -101,6 +101,28 @@ and EFB copies. The backend is GLES 2 on vitaGL. The main files are `vita/src/gx
 - **Display-list vertex cache** (`dl_cache.cpp`, `no_dl_cache` turns it off). Primitives inside
   display lists are cached by data address, layout, count and packet hash. Every 4th hit re-checks
   vertex 0, and on a mismatch the primitive is marked volatile.
+- **GPU transform** (static71, `no_gpu_xf` turns it off). A display-list primitive that hits the DL
+  cache, in a state the shader can evaluate, is drawn straight from a GPU copy of the cache with a
+  vertex shader (`emit_tev_vertex_cg_xf`) that does the position/normal matrices (indexed by the
+  per-vertex matrix index), the projection, texgen and the lighting. The CPU does no per-vertex work
+  for it: no vertex job, no packing. What makes it work:
+  - The DL cache already gives each primitive a stable identity. The static52 mesh cache failed
+    because finding that identity cost more than the transform; here it is free.
+  - The GPU copy (`dl_cache_install_gpu`) mirrors the pool slot for slot, in uncached GPU-mapped
+    memory. An entry is copied the first time it is drawn this way. A copy that would overwrite the
+    previous lap's vertices allocated within the last 3 frames waits for the GPU first (`gsync=`,
+    at most once a frame, and only after the ring has wrapped).
+  - Everything not per vertex is one `GpuXfParams` record per state epoch (`draw_state.hpp`):
+    matrices, projection, colour selection and texgen. Texgen is uniform-driven: source weights,
+    2x4/3x4/SRTG/identity as 3x4 rows, the dual-tex post matrix, normalize, the zero-q fold and SU
+    scale. `gpu_xf_eligible` lists what it covers (texgen from position, normal, texcoord 0 or 1;
+    colour channels on). Everything else stays on the vertex jobs.
+  - Draws of one epoch merge into one GL draw; different epochs cannot (their matrices differ), so
+    expect somewhat more GL draws than before.
+  - `gpu_xf_reference` in `decode.cpp` is the shader in C++. `gx_gpu_xf_tests` compares it with the
+    CPU path over random states and end to end through the decoder.
+  - The program is probed at startup (`gpu_xf_probe`); if the shader compiler refuses it, the GPU
+    transform stays off and boot.log says so.
 - **GPU vertex ring.** Jobs pack into an uncached memblock that the GPU reads directly. A run binds one
   VBO and re-points it with `vglBufferData`. Overwriting data from the last 3 frames forces a `glFinish`
   (`rsync=` in PERF, which should stay 0). `no_vbo_ring` turns the ring off.
@@ -190,7 +212,8 @@ dropped").
   - **`PERF` every ~2 s:**
     - Frame timing: fps, frame/worst ms, guest/decode/submit/copy/swap/render/rwait.
     - Draw counts: draws, GL draws, vertices, `vfast`/`glit`.
-    - Caches and buffers: `dl:` cache hits, `ring=`/`rsync=`, `vpool=`.
+    - Caches and buffers: `dl:` cache hits, `gxf=` vertices drawn with the GPU transform (`gcopy=`
+      copied into its GPU copy, `gsync=` waits for it), `ring=`/`rsync=`, `vpool=`.
     - **`cpu: game= rend= w0= w1= snd= aout=`**, real CPU ms per thread per frame. This is what to
       trust over wall-clock zones.
     - `eng: native= ppc=` for the engine natives.
@@ -211,7 +234,6 @@ dropped").
     at fault. If both are wrong, look at the decoder or HLE.
   - Captures contain game textures, so keep them out of git.
 - **Crashes:** `scripts/parse-vita-core.sh ux0-dump.psp2dmp build-vita/vita/wiicompiled-vita`.
-- **Hot shard ranking:** `scripts/rank-hot-shards.py` ranks shards by sampled time.
 
 **Markers** are empty files in `ux0:data/viicompiled/`, read at boot. Most are A/B switches for one
 optimisation:
@@ -219,7 +241,7 @@ optimisation:
 | group | markers |
 | --- | --- |
 | quality / speed | `perf_turbo`, `efb_low`, `efb_lower`, `fx_low`, `fx_off`, `frameskip`, `frameskip2`, `race_dof` |
-| renderer A/B | `exact_tev`, `cpu_lighting`, `no_dl_cache`, `no_vbo_ring`, `direct_vertex_ring`, `no_prepared_texgen`, `no_merge`, `no_vertex_reuse`, `no_shaders` |
+| renderer A/B | `no_gpu_xf`, `exact_tev`, `cpu_lighting`, `no_dl_cache`, `no_vbo_ring`, `direct_vertex_ring`, `no_prepared_texgen`, `no_merge`, `no_vertex_reuse`, `no_shaders` |
 | threading | `no_render_thread`, `render_nosync`, `render_sync`, `no_vsync`, `no_vertex_worker`, `one_vertex_worker`, `workers_low`, `no_early_handoff`, `no_snd_thread`, `snd_share` |
 | audio | `no_audio`, `reverb`, `mix_inline`, `snd_voice_cap`, `snd_voice_cap_low` |
 | game code | `no_native_engine` |
@@ -233,7 +255,9 @@ These are worth knowing so they don't get tried again without a new reason:
 
 - **Inlining guest memory accessors into the shards.** It doubled shard code and compile time and
   gave no measurable FPS on hardware.
-- **Force-inlining compare/FP helpers.** Small code cost, but also no gain.
+- **Force-inlining compare/FP helpers.** Small code cost, but also no gain. Since then every
+  forced inline in the shards is off: `MKW_PPC_FORCE_INLINE` and `MKWV_MEM_INLINE` are plain
+  `inline` and `MKW_PPC_ALWAYS_INLINE_BODY` is empty on the Vita. Don't bring `always_inline` back.
 - **Register-preserving asm stubs for the accessors.** They removed only ~2% of spills.
 
   The game thread's cost is register pressure, not the accessor calls: 32 GPRs plus 32 FPRs are mapped
@@ -268,16 +292,22 @@ That is ~170 ms of CPU a frame across three cores, so every core is close to ful
   - `RaceScene::OnCalc`
   - the race audio actors (`RaceRSARPlayer`, `SortAndToggleActors`)
   - particles
-- **Render thread.** Vertex decode is still the largest part, with submit next. Look at the `slow:`
-  reasons in PERF (vertices that miss the fast paths), and keep moving work into jobs or onto the GPU.
+- **Render thread.** Before static71, vertex work was the largest part: in a heavy menu ~21k
+  vertices a frame, 19.7k of them DL cache hits, cost ~50 ms of worker CPU. The GPU transform takes
+  those off the CPU. What is left to check on a log: `gxf` against `dl: hit` (hits the shader does
+  not take, and why - `gpu_xf_eligible`), the GL draw count and `sub: draw` (more GL draws with
+  bigger uniform uploads), `vpool`, and `gsync` (should be 0 outside scene changes). Vertices that
+  are not DL hits still go through the jobs; `slow:` says which of those miss the fast paths.
 - **Sound.** If `snd` stays high, cut nw4r's per-frame work (voice counts, update rate).
 - **GPU.** The GPU is not the limit right now (`swap` is ~0.3 ms). If that changes, `efb_low` and
   `efb_lower` tell you whether it is fill-bound.
 
 ## Tests
 
-The host tests run on macOS or Linux and need no Vita or game files (see [BUILD.md](BUILD.md)). The GL
-side runs against a stub GL (`tests/stub_gl`).
+The host tests need no Vita or game files (see [BUILD.md](BUILD.md)). The GL side runs against a stub
+GL (`tests/stub_gl`). The gx tests build anywhere. The runtime tests currently only build on ARM64
+hosts (Apple Silicon): on x86-64, `ppc_isa_quantized.h`'s SSE paths do not compile against the
+paired-single vector type.
 
 **NEON paths** are checked by cross-compiling the gx tests for Cortex-A9 and running them under
 `qemu-arm`. There is no script in the repo for this: use `arm-linux-gnueabihf-g++` with

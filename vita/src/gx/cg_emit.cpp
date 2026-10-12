@@ -597,6 +597,60 @@ void emit_lit_half(Writer& w, const GpuLitParams& lit, unsigned h, unsigned chan
     w.line("    }");
 }
 
+// The GX lighting of a GPU-lit vertex program: COLOR0A0 / COLOR1A1 from the eye position and
+// (unnormalised) eye normal and the raw vertex colours (0..1), named by the caller.
+void emit_lighting_body(Writer& w, const GpuLitParams& lit, unsigned used, bool c0, bool c1, const char* eye,
+                        const char* enrm, const char* col0, const char* col1) {
+    if (used != 0) {
+        w.line("    float3 n = %s;", enrm);
+        w.append("    float nn = dot(n, n);\n");
+        w.append("    if (nn >= 1.0e-20) n = n * rsqrt(nn);\n");
+        for (unsigned li = 0; li < kMaxLights; ++li) {
+            if (!(used & (1u << li))) continue;
+            w.line("    float3 d%u = uLP%u.xyz - %s;", li, li, eye);
+            w.line("    float q%u = dot(d%u, d%u);", li, li, li);
+            w.line("    float dist%u = 0.0;", li);
+            w.line("    if (q%u > 1.0e-20) { float r%u = rsqrt(q%u); dist%u = q%u * r%u; d%u = d%u * r%u; } else { d%u = n; }",
+                   li, li, li, li, li, li, li, li, li, li);
+        }
+    }
+    if (c0) {
+        w.line("    float4 v0 = %s * 255.0;", col0);
+        w.append("    float3 o0; float a0;\n");
+        emit_lit_half(w, lit, 0, 0, "v0", "float3", "rgb", "o0");
+        emit_lit_half(w, lit, 2, 0, "v0", "float", "a", "a0");
+        w.append("    vColor0 = float4(o0, a0) / 255.0;\n");
+    }
+    if (c1) {
+        w.line("    float4 v1 = %s * 255.0;", col1);
+        w.append("    float3 o1; float a1;\n");
+        emit_lit_half(w, lit, 1, 1, "v1", "float3", "rgb", "o1");
+        emit_lit_half(w, lit, 3, 1, "v1", "float", "a", "a1");
+        w.append("    vColor1 = float4(o1, a1) / 255.0;\n");
+    }
+}
+
+// The lighting uniforms a GPU-lit program declares.
+void add_lighting_params(ParamList& params, unsigned used, bool c0, bool c1) {
+    if (c0) {
+        params.add("uniform float4 uMat0");
+        params.add("uniform float4 uAmb0");
+    }
+    if (c1) {
+        params.add("uniform float4 uMat1");
+        params.add("uniform float4 uAmb1");
+    }
+    for (unsigned li = 0; li < kMaxLights; ++li) {
+        if (!(used & (1u << li))) continue;
+        params.add("uniform float4 uLP%u", li);
+        params.add("uniform float4 uLD%u", li);
+        params.add("uniform float4 uLS%u", li);
+        params.add("uniform float4 uLC%u", li);
+        params.add("uniform float4 uLA%u", li);
+        params.add("uniform float4 uLK%u", li);
+    }
+}
+
 } // namespace
 
 bool emit_tev_vertex_cg_lit(const ShaderNeeds& needs, const GpuLitParams& lit, char* out, std::size_t cap,
@@ -623,23 +677,7 @@ bool emit_tev_vertex_cg_lit(const ShaderNeeds& needs, const GpuLitParams& lit, c
         params.add("float3 aEyePos");
         params.add("float3 aEyeNrm");
     }
-    if (c0) {
-        params.add("uniform float4 uMat0");
-        params.add("uniform float4 uAmb0");
-    }
-    if (c1) {
-        params.add("uniform float4 uMat1");
-        params.add("uniform float4 uAmb1");
-    }
-    for (unsigned li = 0; li < kMaxLights; ++li) {
-        if (!(used & (1u << li))) continue;
-        params.add("uniform float4 uLP%u", li);
-        params.add("uniform float4 uLD%u", li);
-        params.add("uniform float4 uLS%u", li);
-        params.add("uniform float4 uLC%u", li);
-        params.add("uniform float4 uLA%u", li);
-        params.add("uniform float4 uLK%u", li);
-    }
+    add_lighting_params(params, used, c0, c1);
     params.add("float4 out vPosition : POSITION");
     if (c0) params.add("float4 out vColor0 : COLOR0");
     if (c1) params.add("float4 out vColor1 : COLOR1");
@@ -667,33 +705,115 @@ bool emit_tev_vertex_cg_lit(const ShaderNeeds& needs, const GpuLitParams& lit, c
     if (needs.fog) {
         w.append("    vZW = aPosition.zw;\n");
     }
-    if (used != 0) {
-        w.append("    float3 n = aEyeNrm;\n");
-        w.append("    float nn = dot(n, n);\n");
-        w.append("    if (nn >= 1.0e-20) n = n * rsqrt(nn);\n");
-        for (unsigned li = 0; li < kMaxLights; ++li) {
-            if (!(used & (1u << li))) continue;
-            w.line("    float3 d%u = uLP%u.xyz - aEyePos;", li, li);
-            w.line("    float q%u = dot(d%u, d%u);", li, li, li);
-            w.line("    float dist%u = 0.0;", li);
-            w.line("    if (q%u > 1.0e-20) { float r%u = rsqrt(q%u); dist%u = q%u * r%u; d%u = d%u * r%u; } else { d%u = n; }",
-                   li, li, li, li, li, li, li, li, li, li);
+    emit_lighting_body(w, lit, used, c0, c1, "aEyePos", "aEyeNrm", "aColor0", "aColor1");
+    w.append("}\n");
+    finish(w, out, written);
+    return w.ok;
+}
+
+bool emit_tev_vertex_cg_xf(const ShaderNeeds& needs, const GpuLitParams& lit, char* out, std::size_t cap,
+                           std::size_t* written) {
+    if (!out || cap < 8) {
+        return false;
+    }
+    const bool c0 = needs.color0;
+    const bool c1 = needs.color1;
+    unsigned used = 0;
+    if (c0) used |= lit.light_mask[0] | lit.light_mask[2];
+    if (c1) used |= lit.light_mask[1] | lit.light_mask[3];
+    bool any_tc = false;
+    for (unsigned c = 0; c < kEmitTexCoordSets; ++c) {
+        any_tc = any_tc || needs.coord_used[c];
+    }
+    ParamList params;
+    params.add("float3 aPosition");
+    params.add("float3 aNormal");
+    if (any_tc) {
+        params.add("float2 aTc0");
+        params.add("float2 aTc1");
+    }
+    if (c0 || c1) {
+        params.add("float4 aColor0");
+        params.add("float4 aColor1");
+    }
+    params.add("float4 aMtx");
+    params.add("uniform float4 uPn[%u]", kMaxPnMtx * 3u);
+    params.add("uniform float4 uNm[%u]", kMaxPnMtx * 3u);
+    params.add("uniform float4 uProj[4]");
+    params.add("uniform float4 uXf");
+    for (unsigned c = 0; c < kEmitTexCoordSets; ++c) {
+        if (!needs.coord_used[c]) continue;
+        params.add("uniform float4 uTgS%u", c);
+        params.add("uniform float4 uTgM%u[3]", c);
+        params.add("uniform float4 uTgP%u[3]", c);
+        params.add("uniform float4 uTgF%u", c);
+        params.add("uniform float4 uTgK%u", c);
+    }
+    add_lighting_params(params, used, c0, c1);
+    params.add("float4 out vPosition : POSITION");
+    if (c0) params.add("float4 out vColor0 : COLOR0");
+    if (c1) params.add("float4 out vColor1 : COLOR1");
+    for (unsigned c = 0; c < kEmitTexCoordSets; ++c) {
+        if (needs.coord_used[c]) {
+            params.add("float%u out vTexcoord%u : TEXCOORD%u", needs.coord_proj[c] ? 3u : 2u, c, c);
         }
     }
-    if (c0) {
-        w.append("    float4 v0 = aColor0 * 255.0;\n");
-        w.append("    float3 o0; float a0;\n");
-        emit_lit_half(w, lit, 0, 0, "v0", "float3", "rgb", "o0");
-        emit_lit_half(w, lit, 2, 0, "v0", "float", "a", "a0");
-        w.append("    vColor0 = float4(o0, a0) / 255.0;\n");
+    if (needs.fog) {
+        params.add("float2 out vZW : TEXCOORD%u", needs.fog_slot);
     }
-    if (c1) {
-        w.append("    float4 v1 = aColor1 * 255.0;\n");
-        w.append("    float3 o1; float a1;\n");
-        emit_lit_half(w, lit, 1, 1, "v1", "float3", "rgb", "o1");
-        emit_lit_half(w, lit, 3, 1, "v1", "float", "a", "a1");
-        w.append("    vColor1 = float4(o1, a1) / 255.0;\n");
+    if (!params.ok) {
+        return false;
     }
+    Writer w{out, out + cap - 1, true};
+    w.append("void main(\n");
+    w.append(params.text);
+    w.append(")\n{\n");
+    // decode.cpp gpu_xf_reference is this, in C++.
+    w.append("    float mi = uXf.y > 0.5 ? aMtx.x : uXf.x;\n");
+    w.line("    if (mi > %u.5) mi = 0.0;", kMaxPnMtx - 1u);
+    w.append("    int r = (int)(mi + 0.25) * 3;\n");
+    w.append("    float4 obj = float4(aPosition, 1.0);\n");
+    w.append("    float3 aEyePos = float3(dot(uPn[r], obj), dot(uPn[r + 1], obj), dot(uPn[r + 2], obj));\n");
+    w.append("    float4 eye = float4(aEyePos, 1.0);\n");
+    w.append("    float cx = dot(uProj[0], eye);\n");
+    w.append("    float cy = dot(uProj[1], eye);\n");
+    w.append("    float cz = dot(uProj[2], eye);\n");
+    w.append("    float cw = dot(uProj[3], eye);\n");
+    w.append("    vPosition = float4(cx, cy, 2.0 * cz + cw, cw);\n");
+    if (needs.fog) {
+        w.append("    vZW = float2(2.0 * cz + cw, cw);\n");
+    }
+    if (used != 0) {
+        w.append("    float4 nobj = float4(aNormal, 0.0);\n");
+        w.append("    float3 aEyeNrm = float3(dot(uNm[r], nobj), dot(uNm[r + 1], nobj), dot(uNm[r + 2], nobj));\n");
+    }
+    if (c0 || c1) {
+        // The colours the lighting reads: COLOR0 if the layout has it, else COLOR1, else white;
+        // COLOR1 only when both are present.
+        w.append("    float4 white = float4(1.0, 1.0, 1.0, 1.0);\n");
+        w.append("    float4 raw0 = uXf.z > 0.5 ? aColor0 : (uXf.w > 0.5 ? aColor1 : white);\n");
+        w.append("    float4 raw1 = (uXf.z > 0.5 && uXf.w > 0.5) ? aColor1 : white;\n");
+    }
+    for (unsigned c = 0; c < kEmitTexCoordSets; ++c) {
+        if (!needs.coord_used[c]) continue;
+        w.line("    {");
+        w.line("        float4 s = float4(aPosition, 1.0) * uTgS%u.x + float4(aNormal, 1.0) * uTgS%u.y +", c, c);
+        w.line("                   float4(aTc0, 1.0, 1.0) * uTgS%u.z + float4(aTc1, 1.0, 1.0) * uTgS%u.w;", c, c);
+        w.line("        if (uTgF%u.x > 0.5) s.z = 1.0;", c);
+        w.line("        float3 t = float3(dot(uTgM%u[0], s), dot(uTgM%u[1], s), dot(uTgM%u[2], s));", c, c, c);
+        w.line("        if (uTgF%u.y > 0.5) { float l = dot(t, t); if (l >= 1.0e-20) t = t * rsqrt(l); }", c);
+        w.line("        float4 t4 = float4(t, 1.0);");
+        w.line("        float3 o = float3(dot(uTgP%u[0], t4), dot(uTgP%u[1], t4), dot(uTgP%u[2], t4));", c, c, c);
+        w.line("        if (uTgF%u.z > 0.5 && o.z == 0.0) o.xy = clamp(o.xy * 0.5, -1.0, 1.0);", c);
+        w.line("        o.xy = o.xy * uTgK%u.xy;", c);
+        if (needs.coord_proj[c]) {
+            w.line("        vTexcoord%u = float3(o.xy, uTgF%u.w > 0.5 ? o.z : 1.0);", c, c);
+        } else {
+            w.line("        vTexcoord%u = o.xy;", c);
+        }
+        w.line("    }");
+    }
+    emit_lighting_body(w, lit, used, c0, c1, "aEyePos", "aEyeNrm", "raw0", "raw1");
     w.append("}\n");
     finish(w, out, written);
     return w.ok;

@@ -22,6 +22,7 @@
 namespace mkwv::gx {
 
 struct Processor;
+class VertexDecoder;
 
 // Lighting evaluated in the vertex shader (static63, "GPU lighting"). The vertex path then only
 // decodes, texgens and transforms; each vertex carries its eye-space position and normal and its
@@ -45,6 +46,43 @@ struct GpuLitParams {
     float cosa[kMaxLights][4]{};      // angle attenuation k0, k1, k2
     float dista[kMaxLights][4]{};     // distance attenuation k0, k1, k2
 };
+
+// GPU transform (static70). A display-list primitive the DL cache already holds (dl_cache.hpp)
+// is drawn straight from the cache's GPU copy: the vertex shader does the position/normal
+// matrices, the projection, texgen and the lighting, so the CPU does no per-vertex work for it
+// at all. Everything the shader needs that is not per vertex, captured once per state epoch.
+// Texgen is fully uniform-driven: per channel, source weights (position, normal, texcoord 0,
+// texcoord 1), the 3x4 matrix (2x4, SRTG and identity are expressed as 3x4 rows), the dual-tex
+// post matrix (identity when off) and flags. See decode.cpp gpu_xf_reference for the arithmetic.
+struct GpuXfParams {
+    float pn[kMaxPnMtx * 3][4];   // position matrices, 3 rows each
+    float nrm[kMaxPnMtx * 3][4];  // normal matrices, 3 rows each (w = 0)
+    float proj[4][4];
+    float misc[4];                // default matrix index, has PNMTXIDX, has COLOR0, has COLOR1
+    float tg_src[kMaxTexGens][4];    // weights: position, normal, texcoord 0, texcoord 1
+    float tg_mtx[kMaxTexGens][3][4];
+    float tg_post[kMaxTexGens][3][4];
+    float tg_flags[kMaxTexGens][4];  // AB11, normalize, fold a zero q, q is the 3x4 output
+    float tg_scale[kMaxTexGens][4];  // SU scale s, t (1 when not manual)
+    std::uint8_t num_pn = 1;      // matrices uploaded (1: the default one, in slot 0)
+    std::uint8_t num_tex_gens = 0;
+    std::uint32_t serial = 0;     // unique per filled record (uniform upload caching)
+};
+
+// Whether this epoch's state can be drawn with the GPU transform (texgen kinds the shader
+// evaluates, colour channels on, a compactable layout).
+bool gpu_xf_eligible(const State& state, const VertexDecoder& decoder);
+void fill_gpu_xf_params(const State& state, const VertexDecoder& decoder, const float (*su_scale)[2], bool su_any,
+                        GpuXfParams& out);
+void set_gpu_xf(bool on);
+bool gpu_xf_enabled();
+// Draw `index` of `processor`'s batch, when it is drawn with the GPU transform: its parameters
+// and its first vertex in the DL cache's GPU copy. False for every other draw.
+struct GpuXfDraw {
+    const GpuXfParams* params;
+    std::uint32_t first;
+};
+bool draw_gpu_xf(const Processor& processor, std::uint32_t index, GpuXfDraw* out);
 
 // Whether lighting may move to the GPU at all (main.cpp; marker cpu_lighting turns it off).
 // Host tests leave it off, so their vertices stay on the CPU lighting path.

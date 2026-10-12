@@ -10,6 +10,8 @@
 // entire reason this file exists.
 
 #include <vitaGL.h>
+#include "mkwv/gx/dl_cache.hpp"
+#include <vector>
 
 #include <cmath>
 #include <cstdio>
@@ -175,7 +177,8 @@ void glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum,
 void glFinish(void) { ++g_finishes; }
 void glBindBuffer(GLenum, GLuint) {}
 void glGenBuffers(GLsizei n, GLuint* out) { for (GLsizei i = 0; i < n; ++i) out[i] = 0; }
-void vglBufferData(GLenum, const GLvoid*) {}
+const void* g_vbo_ptr = nullptr;
+void vglBufferData(GLenum, const GLvoid* p) { g_vbo_ptr = p; }
 void* vglForceAlloc(uint32_t size) { return std::malloc(size); }
 void vglReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, GLvoid* data) {
     if (g_finishes) ++g_mapped_reads;
@@ -1281,6 +1284,99 @@ int main() {
         g_race_probe_count = 0;
         set_race_probe_sheet(false);
         std::filesystem::remove_all(dir);
+    }
+
+    // ---- GPU transform (static70): DL cache hits drawn from the cache's GPU copy ----
+    {
+        static Fifo dl;
+        dl.reset();
+        auto strip = [](Fifo& fifo, float x0) {
+            std::uint8_t vtx[4 * 24];
+            for (unsigned v = 0; v < 4; ++v) {
+                const float p[3] = {x0 + static_cast<float>(v & 1), static_cast<float>(v >> 1), -2.0f};
+                const float t[2] = {0.5f * static_cast<float>(v & 1), 0.5f * static_cast<float>(v >> 1)};
+                std::uint8_t* o = vtx + v * 24;
+                for (unsigned k = 0; k < 3; ++k) {
+                    std::uint32_t bits;
+                    std::memcpy(&bits, &p[k], 4);
+                    o[k * 4 + 0] = static_cast<std::uint8_t>(bits >> 24);
+                    o[k * 4 + 1] = static_cast<std::uint8_t>(bits >> 16);
+                    o[k * 4 + 2] = static_cast<std::uint8_t>(bits >> 8);
+                    o[k * 4 + 3] = static_cast<std::uint8_t>(bits);
+                }
+                o[12] = 0xFF; o[13] = 0x80; o[14] = 0x40; o[15] = 0xFF;
+                for (unsigned k = 0; k < 2; ++k) {
+                    std::uint32_t bits;
+                    std::memcpy(&bits, &t[k], 4);
+                    o[16 + k * 4 + 0] = static_cast<std::uint8_t>(bits >> 24);
+                    o[16 + k * 4 + 1] = static_cast<std::uint8_t>(bits >> 16);
+                    o[16 + k * 4 + 2] = static_cast<std::uint8_t>(bits >> 8);
+                    o[16 + k * 4 + 3] = static_cast<std::uint8_t>(bits);
+                }
+            }
+            fifo.draw(TriangleStrip, VtxFmt0, 4, vtx, sizeof(vtx));
+        };
+        strip(dl, 0.0f);
+        strip(dl, 2.0f);
+        strip(dl, 4.0f);
+        const float m[12] = {1.0f, 0.0f, 0.0f, 0.5f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, -1.0f};
+        dl.load_xf_f32(0, m, 12);  // a new matrix: a second epoch
+        strip(dl, 6.0f);
+        constexpr std::uint32_t kXfDl = 0x80600000u;
+
+        static Fifo f;
+        f.reset();
+        static std::uint8_t tex[4 * 4 * 4];
+        f.set_gen_mode(1, 1, 1);
+        f.set_tev_op(0, TevModulate);
+        f.set_tev_order(0, 0, 0, kRasColor0);
+        f.set_tex_coord_gen(0, TgMtx2x4, TgTex0, kTexMtxIdentity);
+        configure_pos_clr0_tex0_direct(f, VtxFmt0);
+        f.set_viewport(0.0f, 0.0f, 608.0f, 456.0f, 0.0f, 1.0f);
+        f.load_texobj(0, tex, 4, 4, TexRGBA8);
+        f.set_chan_ctrl(0, false, SrcReg, SrcVtx, 0x00, DfClamp, AfNone);
+        f.call_dl(kXfDl, dl.size());
+
+        static std::vector<std::uint8_t> pool(6u * 1024u * 1024u);
+        static std::vector<std::uint8_t> gpu(6u * 1024u * 1024u);
+        set_gpu_lighting(true);
+        set_gpu_xf(true);
+        dl_cache_install(pool.data(), static_cast<std::uint32_t>(pool.size()));
+        dl_cache_install_gpu(gpu.data(), nullptr);
+        set_gpu_xf_buffer(7, gpu.data(), static_cast<std::uint32_t>(gpu.size()));
+        static Processor px;
+        unsigned xf_draws[2] = {0, 0};
+        int gl_draws[2] = {0, 0};
+        for (int frame = 0; frame < 2; ++frame) {
+            px.reset();
+            px.map_range(kXfDl, dl.data(), dl.size());
+            check(px.process(f.data(), f.size(), true), "transform stream decodes");
+            vertex_worker_drain();
+            for (unsigned d = 0; d < px.draw_count; ++d) {
+                GpuXfDraw xd{};
+                xf_draws[frame] += draw_gpu_xf(px, d, &xd) ? 1u : 0u;
+            }
+            const int before = g_gl.draws;
+            g_vbo_ptr = nullptr;
+            submit_processor(px);
+            end_submit_frame();
+            gl_draws[frame] = g_gl.draws - before;
+            if (frame == 1) {
+                const auto* vp = static_cast<const std::uint8_t*>(g_vbo_ptr);
+                check(vp != nullptr && vp >= gpu.data() && vp < gpu.data() + gpu.size(),
+                      "transform draws point the VBO into the GPU copy");
+                check(std::strstr(g_gl.vsrc, "uPn[") != nullptr, "the transform vertex program was built");
+            }
+        }
+        check(px.draw_count == 4, "four DL primitives decoded");
+        check(xf_draws[0] == 0, "the filling frame draws through the vertex jobs");
+        check(xf_draws[1] == 4, "every hit draws with the GPU transform");
+        check(gl_draws[1] == 2, "one GL draw per epoch: three merged strips, then the one after the matrix load");
+        std::printf("gpu transform submit: %d GL draws (fill frame %d)\n", gl_draws[1], gl_draws[0]);
+        set_gpu_xf_buffer(0, nullptr, 0);
+        dl_cache_install(nullptr, 0);
+        set_gpu_xf(false);
+        set_gpu_lighting(false);
     }
 
     if (g_failures != 0) {

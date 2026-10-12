@@ -61,6 +61,9 @@ public:
     // Whether a decoded vertex of this layout fits a CachedVertex without loss (no NBT, no
     // texture-matrix indices, texture coordinates 0 and 1 only).
     bool compactable() const { return compactable_; }
+    // Whether the layout carries a per-vertex position-matrix index, and the index used when not.
+    bool has_pn_idx() const { return has_pn_idx_; }
+    std::uint8_t default_pn_mtx() const { return base_.pn_mtx; }
     // The compact form of a vertex decoded with this layout, and back (restore starts from the
     // current defaults, so the current matrix index still applies when there is no PNMTXIDX).
     static void store(const DecodedVertex& v, CachedVertex& c);
@@ -153,6 +156,13 @@ void fill_gpu_lit_params(const State& state, const PreparedLighting& prepared, G
 void gpu_lit_reference(const GpuLitParams& p, const float eye[3], const float nrm[3], std::uint32_t vtx0,
                        std::uint32_t vtx1, std::uint32_t* color0, std::uint32_t* color1);
 void light_and_transform(const State& state, const PreparedLighting& prepared, DecodedVertex& v);
+
+// The GPU transform's vertex shader (gl_submit.cpp, cg_emit.cpp emit_tev_vertex_cg_xf) in C++:
+// from a cached vertex and the epoch's GpuXfParams to clip position, texture coordinates (s, t,
+// q) and the raw colours the lighting reads, plus the eye position and normal. Host tests
+// compare it with process_vertex. Lighting is gpu_lit_reference's.
+void gpu_xf_reference(const GpuXfParams& p, const CachedVertex& v, float clip[4], float tc[kMaxTexGens][3],
+                      std::uint32_t* raw0, std::uint32_t* raw1, float eye[3], float eye_nrm[3]);
 
 // The parts of State the per-vertex path (texgen, lighting, transform) reads, with the same
 // member names, plus the per-epoch values derived from it. The vertex worker processes

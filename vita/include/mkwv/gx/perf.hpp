@@ -58,6 +58,9 @@ enum Counter : unsigned {
     kSlowCpuLit,     // job vertices off the fast path: lit on the CPU (not GPU-lit eligible)
     kSlowGenCount,   // ... more than two texgens (or SU scale without one)
     kSlowGenKind,    // ... a texgen that is not a 2x4 matrix of its own texcoord
+    kGpuXfVerts,     // DL cache vertices drawn with the GPU transform (no CPU vertex work)
+    kGpuXfCopied,    // vertices copied into the DL cache's GPU copy
+    kGpuXfSyncs,     // GPU waits forced by those copies
     kCounterCount
 };
 

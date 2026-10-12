@@ -138,6 +138,11 @@ int main() {
     // static63: GX lighting in the vertex shader (the CPU only decodes and transforms lit
     // vertices); cpu_lighting keeps it on the CPU.
     mkwv::gx::set_gpu_lighting(!marker_present("cpu_lighting"));
+    // static70: the GPU transform. DL cache hits are drawn straight from a GPU copy of the cache
+    // with a vertex shader doing the matrices, texgen and lighting - no vertex jobs for them.
+    // no_gpu_xf turns it off (it also needs the DL cache and GPU lighting).
+    mkwv::gx::set_gpu_xf(!marker_present("no_gpu_xf") && !marker_present("cpu_lighting") &&
+                         !marker_present("no_dl_cache"));
     // static64: display-list vertex cache (decoded model-space vertices kept across frames) and
     // the GPU vertex ring (vertex jobs pack straight into memory the GPU draws from; vitaGL
     // stops copying every draw's vertices). no_dl_cache / no_vbo_ring turn them off.
@@ -171,12 +176,12 @@ int main() {
         sceIoClose(boot_reset);
     }
     g_boot_log = std::fopen(mkwv::platform::kBootLog, "w");
-    boot_log("mkwv: static69 perf_turbo=%d native_engine=%d memory_inline=0\n", perf_turbo ? 1 : 0, mkwv::runtime::native_engine_enabled() ? 1 : 0);
+    boot_log("mkwv: static71-gpuxf perf_turbo=%d native_engine=%d forced_inline=0\n", perf_turbo ? 1 : 0, mkwv::runtime::native_engine_enabled() ? 1 : 0);
     boot_log("mkwv: gpu mesh cache %s\n", mkwv::gx::gpu_mesh_active() ? "on" : "off");
     boot_log("mkwv: lighting on the %s\n", mkwv::gx::gpu_lighting_enabled() ? "GPU" : "CPU");
     boot_log("mkwv: prepared texgen %s\n", mkwv::gx::prepared_texgen_enabled() ? "on" : "off");
-    boot_log("mkwv: dl vertex cache %s, gpu vertex ring %s\n", marker_present("no_dl_cache") ? "off" : "on",
-             marker_present("no_vbo_ring") ? "off" : "on");
+    boot_log("mkwv: dl vertex cache %s, gpu vertex ring %s, gpu transform %s\n", marker_present("no_dl_cache") ? "off" : "on",
+             marker_present("no_vbo_ring") ? "off" : "on", mkwv::gx::gpu_xf_enabled() ? "wanted" : "off");
     boot_log("mkwv: tev %s, efb scale %.3f, reverb %s, dsp mix %s\n", mkwv::gx::tev_exact() ? "exact" : "fast",
              static_cast<double>(mkwv::gx::efb_scale()), mkwv::runtime::audio_reverb_enabled() ? "on" : "off",
              marker_present("mix_inline") ? "inline" : "deferred");
@@ -311,6 +316,7 @@ int main() {
         mkwv::runtime::set_render_handoff_threshold(0);
     }
     boot_log("mkwv: vitaGL GLES ready\n");
+    boot_log("mkwv: GPU transform %s\n", mkwv::gx::gpu_xf_enabled() ? "on" : "off");
     log_free_memory("after vitaGL");
     g_gx = gx.get();
     runtime.set_present(present_guest);

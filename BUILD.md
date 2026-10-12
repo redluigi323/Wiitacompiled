@@ -146,7 +146,7 @@ the rest are mostly A/B switches for testing a single optimization. [handoff.md]
 
 ## tests
 
-the host tests don't need a Vita or any game files, and run on macOS, Linux and WSL:
+the host tests don't need a Vita or any game files. the renderer (gx) tests build anywhere; the runtime tests currently only build on Apple Silicon (on x86-64 the paired-single SSE code doesn't compile yet):
 
 ```sh
 cmake -S . -B build-host -D MKWV_BUILD_VITA=OFF

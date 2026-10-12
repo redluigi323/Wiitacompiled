@@ -151,7 +151,7 @@ const char* frame_mark(const char* extra) {
     std::snprintf(g_line, sizeof(g_line),
                   "mkwv: PERF fps=%.1f frame=%.1fms worst=%.1fms | guest=%.1f decode=%.1f submit=%.1f (copy=%.1f) "
                   "swap=%.1f sleep=%.1f render=%.1f rwait=%.1f | per frame: draws=%.0f gl=%.0f copies=%.0f/%.0f/%.0f "
-                  "texdec=%.1f prog=%.1f mid=%.1f vreuse=%.0f/%.0f sreuse=%.0f skipped=%u/%u | worker=%.1f help=%.1f (%.0f verts) wwait=%.1f verr=%u vfast=%.0f glit=%.0f | sub: idx=%.1f draw=%.1f | dl: hit=%.0f fill=%.0f rej=%u busy=%.0f | vpool=%.0fK ring=%.0fK rsync=%u rup=%.1f | slow: lit=%.0f ngen=%.0f gen=%.0f | cpu:%s%s\n",
+                  "texdec=%.1f prog=%.1f mid=%.1f vreuse=%.0f/%.0f sreuse=%.0f skipped=%u/%u | worker=%.1f help=%.1f (%.0f verts) wwait=%.1f verr=%u vfast=%.0f glit=%.0f | sub: idx=%.1f draw=%.1f | dl: hit=%.0f fill=%.0f rej=%u busy=%.0f | gxf=%.0f gcopy=%.0f gsync=%u | vpool=%.0fK ring=%.0fK rsync=%u rup=%.1f | slow: lit=%.0f ngen=%.0f gen=%.0f | cpu:%s%s\n",
                   n * 1000000.0 / static_cast<double>(window), static_cast<double>(window) / 1000.0 / n,
                   static_cast<double>(g_worst_frame) / 1000.0, ms(guest), ms(z[kDecode]), ms(z[kSubmit]),
                   ms(z[kCopy]), ms(z[kSwap]), ms(z[kSleep]), ms(z[kRender]), ms(z[kRenderWait]), c[kDraws] / n,
@@ -159,7 +159,8 @@ const char* frame_mark(const char* extra) {
                   c[kPrograms] / n, c[kMidDrains] / n, c[kReusedVertices] / n, c[kVertices] / n, c[kReusedDrawStates] / n,
                   c[kSkippedFrames], g_window_frames, ms(z[kWorker]), ms(z[kHelp]), c[kWorkerVertices] / n, ms(z[kWorkerWait]), c[kVertexErrors],
                   c[kFastVerts] / n, c[kGpuLitVerts] / n, ms(z[kSubmitIndex]), ms(z[kSubmitDraw]),
-                  c[kDlHitVerts] / n, c[kDlFillVerts] / n, c[kDlRejects], c[kDlBusy] / n, c[kVglPoolKb] / n,
+                  c[kDlHitVerts] / n, c[kDlFillVerts] / n, c[kDlRejects], c[kDlBusy] / n, c[kGpuXfVerts] / n,
+                  c[kGpuXfCopied] / n, c[kGpuXfSyncs], c[kVglPoolKb] / n,
                   c[kRingKb] / n, c[kRingSyncs], ms(z[kRingUpload]), c[kSlowCpuLit] / n, c[kSlowGenCount] / n, c[kSlowGenKind] / n, cpu,
                   extra != nullptr ? extra : "");
     g_window_start = now;

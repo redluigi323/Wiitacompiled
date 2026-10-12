@@ -1552,6 +1552,185 @@ void process_vertex_gpu_lit(const State& state, const float (*su_scale)[2], bool
     process_vertex_gpu_lit_impl(state, su_scale, su_any, v);
 }
 
+// ---- GPU transform (static70) ----
+
+bool gpu_xf_eligible(const State& state, const VertexDecoder& decoder) {
+    if (!gpu_xf_enabled() || !gpu_lighting_enabled() || state.num_chans == 0 || !decoder.compactable() ||
+        state.num_tex_gens > kMaxTexGens) {
+        return false;
+    }
+    for (unsigned i = 0; i < state.num_tex_gens; ++i) {
+        const TexGen& gen = state.texgens[i];
+        if (gen.type != TgMtx2x4 && gen.type != TgMtx3x4 && gen.type != TgSrtg) {
+            return false;
+        }
+        if (gen.src != TgPos && gen.src != TgNrm && gen.src != TgTex0 && gen.src != TgTex1) {
+            return false;
+        }
+        if (state.vtx_desc[AttrTex0MtxIdx + i] != AttrNone) {
+            return false;  // per-vertex texture matrices (a compactable layout has none anyway)
+        }
+    }
+    return true;
+}
+
+namespace {
+
+void set_row(float* r, float a, float b, float c, float d) {
+    r[0] = a;
+    r[1] = b;
+    r[2] = c;
+    r[3] = d;
+}
+
+std::uint32_t g_xf_serial = 0;
+
+} // namespace
+
+void fill_gpu_xf_params(const State& state, const VertexDecoder& decoder, const float (*su_scale)[2], bool su_any,
+                        GpuXfParams& out) {
+    const bool has_pn = decoder.has_pn_idx();
+    out.num_pn = has_pn ? static_cast<std::uint8_t>(kMaxPnMtx) : 1u;
+    for (unsigned m = 0; m < out.num_pn; ++m) {
+        unsigned src = m;
+        if (!has_pn) {
+            src = decoder.default_pn_mtx();
+            src = src < kMaxPnMtx ? src : 0u;
+        }
+        for (unsigned r = 0; r < 3u; ++r) {
+            std::memcpy(out.pn[m * 3u + r], &state.pn_mtx[src][r * 4u], sizeof(float) * 4u);
+            const float* nm = &state.nrm_mtx[src][r * 3u];
+            set_row(out.nrm[m * 3u + r], nm[0], nm[1], nm[2], 0.0f);
+        }
+    }
+    std::memcpy(out.proj, state.proj, sizeof(out.proj));
+    out.misc[0] = 0.0f;  // without PNMTXIDX the default matrix sits in slot 0
+    out.misc[1] = has_pn ? 1.0f : 0.0f;
+    out.misc[2] = state.vtx_desc[AttrClr0] != AttrNone ? 1.0f : 0.0f;
+    out.misc[3] = state.vtx_desc[AttrClr1] != AttrNone ? 1.0f : 0.0f;
+    const unsigned n = state.num_tex_gens > kMaxTexGens ? kMaxTexGens : static_cast<unsigned>(state.num_tex_gens);
+    out.num_tex_gens = static_cast<std::uint8_t>(n);
+    for (unsigned i = 0; i < n; ++i) {
+        const TexGen& gen = state.texgens[i];
+        float* w = out.tg_src[i];
+        set_row(w, gen.src == TgPos ? 1.0f : 0.0f, gen.src == TgNrm ? 1.0f : 0.0f, gen.src == TgTex0 ? 1.0f : 0.0f,
+                gen.src == TgTex1 ? 1.0f : 0.0f);
+        float (*m)[4] = out.tg_mtx[i];
+        if (gen.type == TgSrtg) {
+            set_row(m[0], 1, 0, 0, 0);
+            set_row(m[1], 0, 1, 0, 0);
+            set_row(m[2], 0, 0, 0, 1);
+        } else {
+            const unsigned id = gen.mtx;
+            if (id != kTexMtxIdentity && id * 4u + 12u <= kXfMemSize) {
+                std::memcpy(m, state.xf_mem + id * 4u, sizeof(float) * 12u);
+            } else if (id != kTexMtxIdentity && id * 4u + 8u <= kXfMemSize) {
+                std::memcpy(m, state.xf_mem + id * 4u, sizeof(float) * 8u);
+                set_row(m[2], 0, 0, 0, 1);
+            } else {
+                set_row(m[0], 1, 0, 0, 0);
+                set_row(m[1], 0, 1, 0, 0);
+                set_row(m[2], 0, 0, 1, 0);
+            }
+            if (gen.type == TgMtx2x4) {
+                set_row(m[2], 0, 0, 0, 1);
+            }
+        }
+        float (*p)[4] = out.tg_post[i];
+        const unsigned slot = static_cast<unsigned>(gen.post_mtx - kPtTexMtx0) * 4u;
+        if (state.dual_tex && gen.post_mtx != kPtTexMtxIdentity && gen.post_mtx >= kPtTexMtx0 && slot + 12u <= kXfDttSize) {
+            std::memcpy(p, state.xf_dtt + slot, sizeof(float) * 12u);
+        } else {
+            set_row(p[0], 1, 0, 0, 0);
+            set_row(p[1], 0, 1, 0, 0);
+            set_row(p[2], 0, 0, 1, 0);
+        }
+        set_row(out.tg_flags[i], gen.form_ab11 ? 1.0f : 0.0f, (state.dual_tex && gen.normalize) ? 1.0f : 0.0f,
+                gen.type != TgSrtg ? 1.0f : 0.0f, gen.type == TgMtx3x4 ? 1.0f : 0.0f);
+        set_row(out.tg_scale[i], su_any ? su_scale[i][0] : 1.0f, su_any ? su_scale[i][1] : 1.0f, 1.0f, 1.0f);
+    }
+    // Coordinates past the texgen count keep their raw values (texcoords 0 and 1; the others
+    // are not in a compactable layout), as on the CPU path.
+    for (unsigned i = n; i < kMaxTexGens; ++i) {
+        set_row(out.tg_src[i], 0.0f, 0.0f, i == 0 ? 1.0f : 0.0f, i == 1 ? 1.0f : 0.0f);
+        float (*m)[4] = out.tg_mtx[i];
+        float (*p)[4] = out.tg_post[i];
+        set_row(m[0], 1, 0, 0, 0);
+        set_row(m[1], 0, 1, 0, 0);
+        set_row(m[2], 0, 0, 1, 0);
+        set_row(p[0], 1, 0, 0, 0);
+        set_row(p[1], 0, 1, 0, 0);
+        set_row(p[2], 0, 0, 1, 0);
+        set_row(out.tg_flags[i], 0.0f, 0.0f, 0.0f, 0.0f);
+        set_row(out.tg_scale[i], su_any ? su_scale[i][0] : 1.0f, su_any ? su_scale[i][1] : 1.0f, 1.0f, 1.0f);
+    }
+    out.serial = ++g_xf_serial;
+    if (out.serial == 0) {
+        out.serial = ++g_xf_serial;
+    }
+}
+
+void gpu_xf_reference(const GpuXfParams& p, const CachedVertex& v, float clip[4], float tc[kMaxTexGens][3],
+                      std::uint32_t* raw0, std::uint32_t* raw1, float eye[3], float eye_nrm[3]) {
+    auto dot4 = [](const float* r, float x, float y, float z, float w) { return r[0] * x + r[1] * y + r[2] * z + r[3] * w; };
+    unsigned idx = p.misc[1] > 0.5f ? v.pn_mtx : static_cast<unsigned>(p.misc[0]);
+    if (idx >= kMaxPnMtx) {
+        idx = 0;
+    }
+    for (unsigned r = 0; r < 3u; ++r) {
+        eye[r] = dot4(p.pn[idx * 3u + r], v.x, v.y, v.z, 1.0f);
+        eye_nrm[r] = dot4(p.nrm[idx * 3u + r], v.nx, v.ny, v.nz, 0.0f);
+    }
+    const float cx = dot4(p.proj[0], eye[0], eye[1], eye[2], 1.0f);
+    const float cy = dot4(p.proj[1], eye[0], eye[1], eye[2], 1.0f);
+    const float cz = dot4(p.proj[2], eye[0], eye[1], eye[2], 1.0f);
+    const float cw = dot4(p.proj[3], eye[0], eye[1], eye[2], 1.0f);
+    clip[0] = cx;
+    clip[1] = cy;
+    clip[2] = 2.0f * cz + cw;
+    clip[3] = cw;
+    const std::uint32_t white = pack_rgba(255, 255, 255, 255);
+    const bool has0 = p.misc[2] > 0.5f;
+    const bool has1 = p.misc[3] > 0.5f;
+    *raw0 = has0 ? v.color : (has1 ? v.color1 : white);
+    *raw1 = (has0 && has1) ? v.color1 : white;
+    for (unsigned i = 0; i < kMaxTexGens; ++i) {
+        const float* w = p.tg_src[i];
+        float s[4];
+        s[0] = v.x * w[0] + v.nx * w[1] + v.tc[0][0] * w[2] + v.tc[1][0] * w[3];
+        s[1] = v.y * w[0] + v.ny * w[1] + v.tc[0][1] * w[2] + v.tc[1][1] * w[3];
+        s[2] = v.z * w[0] + v.nz * w[1] + w[2] + w[3];
+        s[3] = w[0] + w[1] + w[2] + w[3];
+        if (p.tg_flags[i][0] > 0.5f) {
+            s[2] = 1.0f;
+        }
+        float t[3];
+        for (unsigned r = 0; r < 3u; ++r) {
+            t[r] = dot4(p.tg_mtx[i][r], s[0], s[1], s[2], s[3]);
+        }
+        if (p.tg_flags[i][1] > 0.5f) {
+            const float l = t[0] * t[0] + t[1] * t[1] + t[2] * t[2];
+            if (l >= 1.0e-20f) {
+                const float inv = 1.0f / std::sqrt(l);
+                t[0] *= inv;
+                t[1] *= inv;
+                t[2] *= inv;
+            }
+        }
+        float o[3];
+        for (unsigned r = 0; r < 3u; ++r) {
+            o[r] = dot4(p.tg_post[i][r], t[0], t[1], t[2], 1.0f);
+        }
+        if (p.tg_flags[i][2] > 0.5f && o[2] == 0.0f) {
+            o[0] = std::min(1.0f, std::max(-1.0f, o[0] * 0.5f));
+            o[1] = std::min(1.0f, std::max(-1.0f, o[1] * 0.5f));
+        }
+        tc[i][0] = o[0] * p.tg_scale[i][0];
+        tc[i][1] = o[1] * p.tg_scale[i][1];
+        tc[i][2] = p.tg_flags[i][3] > 0.5f ? o[2] : 1.0f;
+    }
+}
+
 void light_and_transform(const State& state, const PreparedLighting& prepared, DecodedVertex& v) {
     light_and_transform_impl(state, prepared, v);
 }

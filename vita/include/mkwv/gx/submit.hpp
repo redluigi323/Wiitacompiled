@@ -58,6 +58,12 @@ float efb_scale();
 // the run being drawn when its vertices lie in [base, base + bytes) - the ring the vertex jobs
 // pack into (vertex_ring_install). vbo 0 turns it off.
 void set_vertex_ring_buffer(unsigned vbo, const std::uint8_t* base, std::uint32_t bytes);
+// The DL cache's GPU copy (dl_cache.hpp), drawn from by the GPU transform (static70): a VBO
+// whose pointer each run re-points with vglBufferData, and the memory it covers.
+void set_gpu_xf_buffer(unsigned vbo, const std::uint8_t* base, std::uint32_t bytes);
+// Builds one GPU transform program; false when the shader compiler refuses it (then the GPU
+// transform must stay off). Needs a live GL context.
+bool gpu_xf_probe();
 // Before the backend initialises: whether it allocates the GPU vertex ring (no_vbo_ring) and
 // the display-list cache pool (no_dl_cache). Vita backend only.
 void set_vertex_ring_enabled(bool on);

@@ -49,6 +49,25 @@ void dl_cache_drop(const DlCacheRef& ref);
 // A new batch (everything queued before has drained): pending fills become usable.
 void dl_cache_batch_begin();
 
+// ---- GPU copy (static70, "GPU transform") ----
+// A second ring of CachedVertex, the same size as the pool, in memory the GPU reads (uncached
+// and GPU-mapped on the Vita). A hit can then be drawn straight from it by a vertex shader that
+// does the transform, texgen and lighting (gl_submit.cpp), with no vertex job at all. Entries are
+// copied over the first time they are drawn this way. `gpu_sync` waits for the GPU; it runs
+// before a copy would overwrite vertices drawn in the last three frames.
+void dl_cache_install_gpu(void* base, void (*gpu_sync)());
+bool dl_cache_gpu_active();
+const void* dl_cache_gpu_base();
+std::uint32_t dl_cache_gpu_bytes();
+// For a kDlHit: makes sure the entry's vertices are in the GPU copy and returns the index of its
+// first vertex there (the GPU copy is an array of CachedVertex), or ~0u when there is no GPU copy.
+std::uint32_t dl_cache_gpu_vertices(const DlCacheRef& ref, std::uint32_t count);
+// Once per presented frame.
+void dl_cache_frame_mark();
+// GPU waits forced by copies since the last call, and vertices copied.
+std::uint32_t dl_cache_take_gpu_syncs();
+std::uint32_t dl_cache_take_gpu_copied();
+
 struct DlCacheStats {
     std::uint32_t hits = 0, fills = 0, rejects = 0, busy = 0;
     std::uint32_t hit_verts = 0, fill_verts = 0;

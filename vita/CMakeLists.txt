@@ -87,8 +87,8 @@ set(MKWV_SHARDS_CMAKE "${CMAKE_SOURCE_DIR}/upstream/generated/build_shards/shard
 if(EXISTS "${MKWV_SHARDS_CMAKE}")
   include("${MKWV_SHARDS_CMAKE}")
   if(MKW_BASE_COMMON_SHARDS)
-    # static68: the unhelpful forced memory-inline experiment is removed.
-    # Clear stale cache values too, so old configure commands cannot turn it back on.
+    # Forced inlining is gone for good (memory accessors, compare/FP helpers, always_inline ISA
+    # helpers). Clear stale cache values too, so old configure commands cannot turn it back on.
     set(MKWV_SHARD_MEMORY_INLINE OFF CACHE BOOL "Removed: guest RAM inlining" FORCE)
     set(MKWV_SHARD_MEMORY_INLINE_ALL OFF CACHE BOOL "Removed: guest RAM inlining" FORCE)
     set(MKWV_SHARD_HOT_INLINE OFF CACHE BOOL "Removed: forced compare/FP helper inlining" FORCE)

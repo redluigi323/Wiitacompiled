@@ -20,7 +20,9 @@
 extern "C" std::uintptr_t mkwv_fast_page_bias[4096];
 
 #if defined(__GNUC__)
-#define MKWV_MEM_INLINE inline __attribute__((always_inline))
+// Plain inline on purpose: forcing these into every translated access did not pay off (see
+// handoff.md, "Tried and dropped").
+#define MKWV_MEM_INLINE inline
 #define MKWV_MEM_LIKELY(x) __builtin_expect(!!(x), 1)
 #else
 #define MKWV_MEM_INLINE inline

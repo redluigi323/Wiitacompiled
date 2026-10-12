@@ -31,7 +31,9 @@ bool g_dl_pool_wanted = true;
 // static64: GPU vertex ring and display-list cache memory, outside vitaGL's pools. The ring is
 // uncached main RAM mapped for the GPU, filled by completed cached batches by default;
 // the DL cache pool is ordinary cached RAM.
-constexpr unsigned kRingBytes = 6u * 1024u * 1024u;  // static64 log: ~1.3 MiB packed a frame
+// static70: 8 MiB. The staged ring keeps four frames live (N-3..N) plus a batch's wrap waste;
+// at ~1.4 MiB a frame 6 MiB forced 13-17 GPU waits per PERF window in menus (rsync).
+constexpr unsigned kRingBytes = 8u * 1024u * 1024u;
 constexpr unsigned kDlPoolBytes = 6u * 1024u * 1024u;  // ~15k hit vertices a frame (~0.8 MiB)
 
 void ring_gpu_sync() {
@@ -68,6 +70,36 @@ void setup_vertex_memory() {
         } else {
             std::printf("mkwv: display-list vertex cache unavailable (block %d)\n", static_cast<int>(block));
         }
+    }
+    // static70: the DL cache's GPU copy, for the GPU transform. Uncached and GPU-mapped like the
+    // ring; entries are copied over once, the first time they are drawn this way.
+    if (gpu_xf_enabled() && dl_cache_active()) {
+        bool ok = false;
+        const SceUID block = sceKernelAllocMemBlock("mkwv_dlgpu", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, kDlPoolBytes, nullptr);
+        void* base = nullptr;
+        if (block >= 0 && sceKernelGetMemBlockBase(block, &base) >= 0 && base != nullptr &&
+            sceGxmMapMemory(base, kDlPoolBytes, SCE_GXM_MEMORY_ATTRIB_READ) >= 0) {
+            GLuint vbo = 0;
+            glGenBuffers(1, &vbo);
+            if (vbo != 0 && gpu_xf_probe()) {
+                dl_cache_install_gpu(base, &ring_gpu_sync);
+                set_gpu_xf_buffer(vbo, static_cast<const std::uint8_t*>(base), kDlPoolBytes);
+                ok = true;
+                std::printf("mkwv: GPU transform on (DL cache GPU copy %u KiB at %p, vbo %u)\n", kDlPoolBytes >> 10, base, vbo);
+            } else {
+                std::printf("mkwv: GPU transform off: %s\n", vbo == 0 ? "no VBO" : "the vertex program did not compile");
+            }
+        } else {
+            std::printf("mkwv: GPU transform off: GPU copy unavailable (block %d)\n", static_cast<int>(block));
+        }
+        if (!ok) {
+            set_gpu_xf(false);
+            if (block >= 0) {
+                sceKernelFreeMemBlock(block);
+            }
+        }
+    } else {
+        set_gpu_xf(false);
     }
 }
 
@@ -130,6 +162,11 @@ void do_swap() {
         perf::count(perf::kRingKb, vertex_ring_frame_bytes() >> 10);
         perf::count(perf::kRingSyncs, vertex_ring_take_syncs());
         vertex_ring_frame_mark();
+    }
+    if (dl_cache_gpu_active()) {
+        perf::count(perf::kGpuXfCopied, dl_cache_take_gpu_copied());
+        perf::count(perf::kGpuXfSyncs, dl_cache_take_gpu_syncs());
+        dl_cache_frame_mark();
     }
     vglSwapBuffers(GL_FALSE);
 }

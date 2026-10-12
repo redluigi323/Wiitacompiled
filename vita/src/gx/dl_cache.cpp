@@ -24,6 +24,7 @@ struct Entry {
     std::uint32_t hits = 0;
     bool used = false;
     bool volatile_data = false;  // its arrays changed under it once: never cached again
+    bool on_gpu = false;         // copied into the GPU ring since it was (re)filled
 };
 
 Entry g_table[kSlots];
@@ -33,6 +34,18 @@ std::uint64_t g_head = 0;  // absolute vertices allocated
 bool g_enabled = true;
 std::uint32_t g_serial = 1;
 DlCacheStats g_stats;
+
+// GPU copy. Its slots are the pool's: an entry's vertices sit at the same index in both. A
+// copy overwrites whatever the previous lap of the ring left at that index, which the GPU may
+// still be drawing if that data was valid recently - that is, if this entry was allocated (which
+// is when the old data stopped being valid) after the start of frame N-3. Then the copy waits for
+// the GPU first; once per frame at most, since after a wait everything allocated so far is safe.
+CachedVertex* g_gpu = nullptr;
+void (*g_gpu_sync)() = nullptr;
+std::uint64_t g_head_at_frame[4] = {};  // g_head when each of the last four frames began
+std::uint32_t g_frame = 0;
+std::uint32_t g_gpu_syncs = 0;
+std::uint32_t g_gpu_copied = 0;
 
 inline std::uint32_t slot_of(std::uint32_t addr, std::uint64_t sig, std::uint32_t count) {
     std::uint64_t h = (static_cast<std::uint64_t>(addr) * 0x9E3779B97F4A7C15ull) ^ sig ^ (count * 0xC2B2AE3D27D4EB4Full);
@@ -61,6 +74,7 @@ bool allocate(Entry& e, std::uint32_t count) {
     g_head += count;
     e.ready = g_serial;
     e.hits = 0;
+    e.on_gpu = false;
     return true;
 }
 
@@ -93,6 +107,7 @@ void dl_cache_install(void* pool, std::uint32_t bytes) {
         e = Entry{};
     }
     g_head = 0;
+    g_gpu = nullptr;  // a new pool needs its GPU copy installed again
     if (pool == nullptr || bytes / sizeof(CachedVertex) < 3u * kBatchGuard) {
         g_pool = nullptr;
         g_cap = 0;
@@ -100,6 +115,77 @@ void dl_cache_install(void* pool, std::uint32_t bytes) {
     }
     g_pool = static_cast<CachedVertex*>(pool);
     g_cap = bytes / sizeof(CachedVertex);
+}
+
+void dl_cache_install_gpu(void* base, void (*gpu_sync)()) {
+    g_gpu = nullptr;
+    g_gpu_sync = gpu_sync;
+    for (Entry& e : g_table) {
+        e.on_gpu = false;
+    }
+    for (auto& h : g_head_at_frame) {
+        h = g_head;
+    }
+    if (base == nullptr || g_pool == nullptr) {
+        return;
+    }
+    g_gpu = static_cast<CachedVertex*>(base);
+}
+
+bool dl_cache_gpu_active() {
+    return g_gpu != nullptr && dl_cache_active();
+}
+
+const void* dl_cache_gpu_base() {
+    return g_gpu;
+}
+
+std::uint32_t dl_cache_gpu_bytes() {
+    return g_gpu != nullptr ? static_cast<std::uint32_t>(g_cap * sizeof(CachedVertex)) : 0u;
+}
+
+std::uint32_t dl_cache_gpu_vertices(const DlCacheRef& ref, std::uint32_t count) {
+    if (g_gpu == nullptr || ref.data == nullptr) {
+        return ~0u;
+    }
+    Entry& e = g_table[ref.slot & (kSlots - 1u)];
+    const std::uint32_t first = static_cast<std::uint32_t>(ref.data - g_pool);
+    if (first + count > g_cap) {
+        return ~0u;
+    }
+    if (!e.on_gpu) {
+        const std::uint64_t oldest = g_head_at_frame[(g_frame + 1u) & 3u];  // start of frame N-3
+        if (e.pos >= g_cap && e.pos + count > oldest && g_gpu_sync != nullptr) {
+            g_gpu_sync();
+            ++g_gpu_syncs;
+            for (auto& h : g_head_at_frame) {
+                h = g_head;  // everything allocated so far has been waited for
+            }
+        }
+        std::memcpy(g_gpu + first, g_pool + first, sizeof(CachedVertex) * count);
+#if defined(__arm__) || defined(__aarch64__)
+        asm volatile("dsb sy" ::: "memory");  // uncached stores complete before the GPU is kicked
+#endif
+        e.on_gpu = true;
+        g_gpu_copied += count;
+    }
+    return first;
+}
+
+void dl_cache_frame_mark() {
+    ++g_frame;
+    g_head_at_frame[g_frame & 3u] = g_head;
+}
+std::uint32_t dl_cache_take_gpu_syncs() {
+    const std::uint32_t n = g_gpu_syncs;
+    g_gpu_syncs = 0;
+    return n;
+}
+
+std::uint32_t dl_cache_take_gpu_copied() {
+    const std::uint32_t n = g_gpu_copied;
+    g_gpu_copied = 0;
+    return n;
 }
 
 void dl_cache_set_enabled(bool on) {
