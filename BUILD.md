@@ -2,18 +2,18 @@
 
 > **heads up:** the game isn't fully ready. the framerate will be unideal: a race runs at around 20fps, and grand prix runs lower until you get into 1st. if you're willing to sit through that, it's playable minus some small renderer glitches. don't build this expecting a finished port.
 
-this has only been built on macOS (Apple Silicon). Linux should work since it's all bash, CMake and .NET. Windows will need WSL.
+the build runs on **macOS**, **Linux**, and **Windows through WSL2**. the scripts are bash, so on Windows everything below happens inside a WSL2 terminal, not PowerShell or Git Bash.
 
 ## what you need
 
 **on your computer**
 
-- [vitasdk](https://vitasdk.org), with `VITASDK` set and `$VITASDK/bin` on your `PATH`
-- CMake 3.16+, git and Python 3
+- [vitasdk](https://vitasdk.org), with `VITASDK` set (the scripts also find it at `/usr/local/vitasdk`)
+- CMake 3.16+, git, Python 3, and a normal C/C++ toolchain for vitasdk's tools
 - the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0), for wiicompiled's translator
-- [wit](https://wit.wiimm.de) or anything else that can extract a Wii disc to a folder
+- [wit](https://wit.wiimm.de), or anything else that can extract a Wii disc to a folder
 - a clean PAL Mario Kart Wii image (`RMCP01`). other regions and modified dumps get rejected by the translator.
-- around 4 GB of free disk space for the dump, the translated sources and the build folder
+- around 4 GB of free disk space, plus about 0.5 GB of RAM for each parallel compile job
 
 **on your Vita**
 
@@ -21,6 +21,55 @@ this has only been built on macOS (Apple Silicon). Linux should work since it's 
 - `libshacccg.suprx` at `ur0:data/libshacccg.suprx`. dump it from your own firmware with [ShaRKF00D](https://github.com/Rinnegatamante/ShaRKF00D). without it nothing renders, and `boot.log` will say it's missing.
 
 the app requests 444 MHz on its own. if a kernel overclock plugin lets it, it takes 500.
+
+## 0. setting up your machine
+
+pick the one you're on, then install vitasdk with vdpm (shown at the end of this section).
+
+### macOS
+
+```sh
+xcode-select --install
+brew install cmake python git wget
+brew install --cask dotnet-sdk@8
+```
+
+### Linux (Debian/Ubuntu)
+
+```sh
+sudo apt update
+sudo apt install build-essential cmake git python3 python3-venv curl wget xz-utils bzip2 libarchive-tools
+sudo apt install dotnet-sdk-8.0
+```
+
+if your release doesn't ship `dotnet-sdk-8.0`, use [Microsoft's install script](https://learn.microsoft.com/dotnet/core/install/linux-scripted-manual). Fedora and Arch have `dotnet-sdk-8.0` in their own repos.
+
+### Windows (WSL2)
+
+in an admin PowerShell, install WSL2 with Ubuntu and restart when it asks:
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+then open the Ubuntu terminal and follow the Linux steps above.
+
+**clone and build inside the WSL filesystem** (for example `~/Wiitacompiled`), not on `C:` (`/mnt/c/...`). compiling through `/mnt/c` is several times slower, and `build-vita.sh` warns you if you try. if you want to reach the files from Windows, they're at `\\wsl$\Ubuntu\home\<you>\Wiitacompiled` in Explorer.
+
+your disc image can stay on Windows. pass its `/mnt/c/...` path to wit.
+
+### vitasdk (all three)
+
+```sh
+git clone https://github.com/vitasdk/vdpm
+cd vdpm
+./bootstrap-vitasdk.sh
+./install-all.sh
+echo 'export VITASDK=/usr/local/vitasdk' >> ~/.bashrc   # ~/.zshrc on macOS
+echo 'export PATH="$VITASDK/bin:$PATH"' >> ~/.bashrc
+```
+
+open a new terminal afterwards. `./scripts/bootstrap-vitasdk.sh` in this repo checks that it worked.
 
 ## 1. fetch the dependencies
 
@@ -36,65 +85,28 @@ this clones wiicompiled into `upstream/` and vitaGL, vitaShaRK and math-neon int
 
 ```sh
 wit extract /path/to/RMCP01.iso mariokartwii
+./scripts/link-mkw-assets.sh
 ```
 
 the scripts expect `mariokartwii/DATA/sys/main.dol` and `mariokartwii/DATA/files/`. if your extractor didn't make the `DATA/` folder, move `sys` and `files` into one. `mariokartwii/` is gitignored.
 
-then point the translator at it. this makes symlinks, so nothing gets copied:
-
-```sh
-./scripts/link-mkw-assets.sh
-```
+`link-mkw-assets.sh` points the translator at the dump with symlinks, so nothing gets copied. it prints the hashes of `main.dol` and `StaticR.rel`.
 
 ## 3. translate the game
 
-this is the same pipeline as upstream wiicompiled (see `upstream/docs/building-macos.md`). it only has to run once (and again if you ever change the dump), and the output (~400 MB) stays in `upstream/generated/`.
-
 ```sh
-cd upstream
-JOBS=$(sysctl -n hw.ncpu 2>/dev/null || nproc)
-
-dotnet build translator/src/Translator.Cli/Translator.Cli.csproj -c Release
-translator() { dotnet "$(pwd)/translator/src/Translator.Cli/bin/Release/net8.0/Translator.Cli.dll" "$@"; }
-
-mkdir -p generated/functions build/base generated/build_shards
-
-translator translate-recursive 0x800060A4 \
-  --project projects/mkwii/recomp.yml \
-  --outdir generated/functions \
-  --output-metadata generated/base_translation_output.json \
-  --production-source-bundle generated/base_translation_sources.bin \
-  --no-function-files --prune-stale --threads $JOBS
-
-translator emit-base-manifest \
-  --project projects/mkwii/recomp.yml \
-  --out build/base \
-  --functions-dir generated/functions \
-  --translation-output-metadata generated/base_translation_output.json \
-  --region P
-
-translator generate-data-init --project projects/mkwii/recomp.yml
-
-translator emit-build-shards \
-  --project projects/mkwii/recomp.yml \
-  --base-metadata generated/base_translation_output.json \
-  --base-functions-dir generated/functions \
-  --native-source-dir runtime/src \
-  --out generated/build_shards
-
-cd ..
+./scripts/translate-game.sh
 ```
 
-retro rewind isn't supported on the Vita yet, so use the base-game shards only.
+this runs wiicompiled's translator over your dump: it builds the translator, translates the game, then generates the guest data and the build shards (base game only, retro rewind isn't supported on the Vita yet). it only has to run once, and again if you ever change the dump. the output (~400 MB) stays in `upstream/generated/`. `JOBS=N` limits the threads it uses.
 
 ## 4. build the VPK
 
 ```sh
-cmake -S . -B build-vita -D MKWV_BUILD_VITA=ON
-cmake --build build-vita -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
+./scripts/build-vita.sh
 ```
 
-the first build is the slow one. the translated game is split into ~74 large shards, and each takes the compiler around half a minute and about 400 MB of RAM. on a machine with less than 16 GB, give `-j` a lower number than your core count. without `-j` at all, CMake builds them one at a time and it takes well over an hour.
+the first build is the slow one. the translated game is split into ~74 large shards, and each takes the compiler around half a minute and about 0.5 GB of RAM. the script uses all your CPU threads but caps the job count by RAM. `JOBS=N` overrides that. extra arguments go to the CMake configure step.
 
 you end up with `build-vita/vita/wiicompiled-vita.vpk` (title id `MKWV00001`).
 
@@ -116,9 +128,9 @@ the VPK only has the port in it. the game data goes in `ux0:data/viicompiled/`:
 | `ux0:data/viicompiled/sys/` | everything inside `mariokartwii/DATA/sys/` (needs `fst.bin`) |
 | `ux0:data/viicompiled/guest/` | the `.bin` files from `upstream/generated/data_sections_init_blobs/` |
 
-`./scripts/setup-ux0-data.sh` builds that same tree locally under `ux0-data/viicompiled` (and in Vita3K's folder if it finds one). the result is symlinks though, so copy the real files over with VitaShell's FTP or USB mode.
+copy them over with VitaShell's FTP or USB mode, then install the VPK and launch it.
 
-then install the VPK and launch it.
+`./scripts/setup-ux0-data.sh` builds that same tree locally under `ux0-data/viicompiled`. if it finds Vita3K (in its usual place on macOS, Linux or Windows, or wherever `VITA3K_UX0_DATA` points), it fills Vita3K's `ux0` too. it uses symlinks, except for a Windows install of Vita3K reached from WSL: Windows can't follow WSL symlinks, so there it copies the files instead. that takes a couple of GB.
 
 ## if something goes wrong
 
@@ -130,11 +142,11 @@ behaviour can be switched by creating empty files in `ux0:data/viicompiled/` and
 
 - `perf_turbo` renders at 0.75 resolution, turns effects off and lowers the sound budget. it looks worse but runs faster.
 
-the rest are mostly A/B switches for testing a single optimization (`no_native_engine`, `no_dl_cache`, `no_vbo_ring` and others). they're documented with the round that added them in [handoff.md](handoff.md) and [docs/](docs).
+the rest are mostly A/B switches for testing a single optimization. [handoff.md](handoff.md) lists all of them.
 
 ## tests
 
-the host tests don't need a Vita or any game files:
+the host tests don't need a Vita or any game files, and run on macOS, Linux and WSL:
 
 ```sh
 cmake -S . -B build-host -D MKWV_BUILD_VITA=OFF

@@ -16,7 +16,7 @@ if you're willing to sit through a race at 20fps it's playable. the steps to bui
 
 ## the renderer
 
-on PC, wiicompiled draws through [aurora](https://github.com/encounter/aurora), which turns the Wii's GX commands into WebGPU via Dawn. Dawn doesn't exist on the Vita's SGX543, so aurora's GX layer (command FIFO, vertex formats, TEV, EFB copies) was ported to GLES and runs on [vitaGL](https://github.com/Rinnegatamante/vitaGL). TEV setups become shaders that get compiled on the Vita itself through [vitaShaRK](https://github.com/Rinnegatamante/vitaShaRK), which is why `libshacccg.suprx` is required.
+on PC, wiicompiled draws through [aurora](https://github.com/encounter/aurora), which turns the Wii's GX commands into WebGPU via Dawn. porting dawn to the vita's hardware wasnt a good idea, so aurora's GX layer (command FIFO, vertex formats, TEV, EFB copies) was ported to GLES and runs on [vitaGL](https://github.com/Rinnegatamante/vitaGL). TEV setups become shaders that get compiled on the Vita itself through [vitaShaRK](https://github.com/Rinnegatamante/vitaShaRK), which is why `libshacccg.suprx` is required.
 
 ## what's been done to make it run
 

@@ -1,81 +1,58 @@
 #!/usr/bin/env bash
-# Wire PAL RMCP01 disc + guest blobs into ux0:data/viicompiled without copying
-# Nintendo bytes into the VPK or the git tree.
+# Lay out ux0:data/viicompiled (disc/, sys/, guest/) from your dump and the translator output,
+# without copying Nintendo bytes into the VPK or the git tree.
+#
+# Always builds ./ux0-data/viicompiled (symlinks, for reference or for copying to a Vita).
+# If Vita3K is installed it also fills Vita3K's ux0. On macOS/Linux that is symlinks; for a
+# Windows Vita3K reached from WSL the files are copied, since Windows can't follow WSL symlinks.
+#   MKW_DUMP=dir          dump location (default ./mariokartwii)
+#   VITA3K_UX0_DATA=dir   Vita3K's ux0/data folder, if it isn't found on its own
 set -euo pipefail
+. "$(dirname "$0")/lib/host.sh"
+refuse_native_windows
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 dump="${MKW_DUMP:-${root}/mariokartwii}"
 files="${dump}/DATA/files"
 sys="${dump}/DATA/sys"
+guest_src="${root}/upstream/generated/data_sections_init_blobs"
 
 if [[ ! -d "${files}" || ! -f "${sys}/fst.bin" ]]; then
-  echo "setup-ux0-data: expected WIT extract at ${dump}/DATA/files and ${sys}/fst.bin" >&2
+  echo "setup-ux0-data: expected an extracted disc at ${dump}/DATA/files and ${sys}/fst.bin" >&2
   exit 1
 fi
 
-vita3k_data=""
-for candidate in \
-  "${HOME}/Library/Application Support/Vita3K/Vita3K/fs/ux0/data" \
-  "${HOME}/Library/Application Support/Vita3K/Vita3K/ux0/data" \
-  "${HOME}/Library/Application Support/Vita3K/ux0/data"; do
-  if [[ -d "${candidate}" ]]; then
-    vita3k_data="${candidate}"
-    break
+link_or_copy() { # src dest-dir
+  local src="$1" dest="$2"
+  if is_windows_path "${dest}"; then
+    [[ -L "${dest}" ]] && rm -f "${dest}"
+    mkdir -p "${dest}"
+    echo "  copying $(basename "${dest}")/ (Windows can't read WSL symlinks)..."
+    cp -R -u "${src}/." "${dest}/"
+  else
+    ln -sfn "${src}" "${dest}"
   fi
-done
-
-setup_tree() {
-  local dest="$1"
-  mkdir -p "${dest}/viicompiled"
-  ln -sfn "${files}" "${dest}/viicompiled/disc"
-  ln -sfn "${sys}" "${dest}/viicompiled/sys"
-
-  if [[ -d "${dest}/mkwv" && ! -L "${dest}/mkwv" ]]; then
-    mkdir -p "${dest}/viicompiled/guest" "${dest}/viicompiled/overlay"
-    if [[ -d "${dest}/mkwv/guest" ]]; then
-      cp -R "${dest}/mkwv/guest/." "${dest}/viicompiled/guest/"
-    fi
-    if [[ -d "${dest}/mkwv/overlay" ]]; then
-      cp -R "${dest}/mkwv/overlay/." "${dest}/viicompiled/overlay/"
-    fi
-    shopt -s nullglob
-    for gxp in "${dest}/mkwv/"*.gxp "${dest}/mkwv/boot.log"; do
-      if [[ -e "${gxp}" ]]; then
-        mv -f "${gxp}" "${dest}/viicompiled/"
-      fi
-    done
-    shopt -u nullglob
-    rm -rf "${dest}/mkwv"
-  fi
-
-  ln -sfn viicompiled "${dest}/mkwv"
 }
 
-echo "dump files -> ${files}"
-echo "dump sys   -> ${sys}"
+setup_tree() { # ux0/data dir
+  local dest="$1/viicompiled"
+  mkdir -p "${dest}"
+  link_or_copy "${files}" "${dest}/disc"
+  link_or_copy "${sys}" "${dest}/sys"
+  if [[ -f "${guest_src}/StaticR.bin" ]]; then
+    bash "${root}/scripts/install-guest-data.sh" "${dest}/guest" >/dev/null
+  else
+    echo "  guest/ skipped: run scripts/translate-game.sh first" >&2
+  fi
+  echo "ux0:data/viicompiled -> ${dest}"
+}
 
-local_dest="${root}/ux0-data"
-setup_tree "${local_dest}"
-echo "project ux0-data: ${local_dest}/viicompiled"
-echo "  disc -> $(readlink "${local_dest}/viicompiled/disc")"
-echo "  sys  -> $(readlink "${local_dest}/viicompiled/sys")"
+setup_tree "${root}/ux0-data"
 
+vita3k_data="$(vita3k_ux0_data)"
 if [[ -n "${vita3k_data}" ]]; then
   setup_tree "${vita3k_data}"
-  echo "Vita3K ux0:data: ${vita3k_data}/viicompiled"
-  echo "  disc -> $(readlink "${vita3k_data}/viicompiled/disc")"
-  echo "  sys  -> $(readlink "${vita3k_data}/viicompiled/sys")"
 else
-  echo "Vita3K ux0/data not found; created ${local_dest} only"
+  echo "Vita3K's ux0/data not found (set VITA3K_UX0_DATA if it is installed). Only ./ux0-data was made."
 fi
-
-guest_src="${root}/upstream/generated/data_sections_init_blobs"
-if [[ -f "${guest_src}/StaticR.bin" ]]; then
-  "${root}/scripts/install-guest-data.sh" "${local_dest}/viicompiled/guest"
-  if [[ -n "${vita3k_data}" ]]; then
-    "${root}/scripts/install-guest-data.sh" "${vita3k_data}/viicompiled/guest"
-  fi
-fi
-
-echo "Vita path: ux0:data/viicompiled (compat symlink ux0:data/mkwv)"
-ls -ld "${local_dest}/viicompiled/disc/opening.bnr" "${local_dest}/viicompiled/sys/fst.bin"
+echo "On a real Vita, copy the contents of disc/, sys/ and guest/ into ux0:data/viicompiled/ (see BUILD.md)."

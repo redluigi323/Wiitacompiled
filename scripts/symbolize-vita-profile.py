@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Symbolize static65+ HPROF PC/LR buckets using the ELF from the same VPK build."""
 import argparse
+import os
 from collections import defaultdict
 from pathlib import Path
 import re
@@ -11,7 +12,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", type=Path, help="watchdog.log from the Vita")
     parser.add_argument("--elf", type=Path, default=Path("build-vita/vita/wiicompiled-vita"))
-    parser.add_argument("--sdk", type=Path, default=Path("/usr/local/vitasdk"))
+    parser.add_argument("--sdk", type=Path, default=Path(os.environ.get("VITASDK", "/usr/local/vitasdk")))
     args = parser.parse_args()
     nm = args.sdk / "bin/arm-vita-eabi-nm"
     addr2line = args.sdk / "bin/arm-vita-eabi-addr2line"

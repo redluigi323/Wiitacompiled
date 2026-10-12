@@ -18,9 +18,15 @@
 # If a header the shards genuinely depend on has changed, the script refuses and asks for a full
 # build rather than stamping over a real ABI change. FORCE=1 overrides that, at your own risk.
 set -euo pipefail
+. "$(dirname "$0")/lib/host.sh"
+refuse_native_windows
 cd "$(dirname "$0")/.."
 BUILD_DIR="${BUILD_DIR:-build-vita}"
-JOBS="${JOBS:-3}"
+JOBS="${JOBS:-$(host_shard_jobs)}"
+if [[ -z "${VITASDK:-}" && -x /usr/local/vitasdk/bin/arm-vita-eabi-gcc ]]; then
+  export VITASDK=/usr/local/vitasdk
+fi
+[[ -n "${VITASDK:-}" ]] && export PATH="${VITASDK}/bin:${PATH}"
 SHARD_MANIFEST="$BUILD_DIR/vita/translated-objects.txt"
 if [ ! -f "$SHARD_MANIFEST" ]; then
   echo "Missing $SHARD_MANIFEST - configure CMake and run the full build first." >&2
@@ -87,7 +93,7 @@ if [ ${#STALE[@]} -ne 0 ] && [ "${FORCE:-0}" != "1" ]; then
   echo "These shard-ABI inputs changed since the shards were built:" >&2
   printf '  %s\n' "${STALE[@]}" >&2
   echo "The shards must be rebuilt. Run the full build:" >&2
-  echo "  cmake --build $BUILD_DIR --target wiicompiled-vita.vpk-vpk -j$JOBS" >&2
+  echo "  scripts/build-vita.sh" >&2
   echo "(FORCE=1 $0 stamps over this - only if you are certain the ABI is unchanged.)" >&2
   exit 1
 fi
