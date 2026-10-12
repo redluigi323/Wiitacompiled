@@ -1,0 +1,80 @@
+diff --git a/source/framebuffers.c b/source/framebuffers.c
+index 15e59ea..5950c85 100644
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -876,6 +876,10 @@ void glBlitNamedFramebuffer(GLuint readFramebuffer, GLuint drawFramebuffer, GLin
+ 	
+ 	// Filling position and texcoord values
+ 	float *vertex_data = (float *)gpu_alloc_mapped_temp(16 * sizeof(float));
++	if (!vertex_data) {
++		active_write_fb = real_write_fb;
++		return;
++	}
+ 	// Position
+ 	vector4f tmp;
+ 	vector4f_convert_to_local_space(&tmp, dstX0, dstY0, dstX1 - dstX0, dstY1 - dstY0);
+diff --git a/source/gxm.c b/source/gxm.c
+index 29bf21a..21def1f 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -306,16 +306,23 @@ int garbage_collector(unsigned int args, void *arg) {
+ 
+ GLboolean start_shader_compiler(void) {
+ 	shark_set_allocators(vglMalloc, vglFree);
++#ifdef HAVE_VITA3K_SUPPORT
++	// shark_init() enables SceShaccCgExt (taiHEN). Vita3K needs shark_init_simple().
++	is_shark_online = shark_init_simple(NULL) >= 0;
++	if (!is_shark_online)
++		is_shark_online = shark_init_simple("ur0:data/external/libshacccg.suprx") >= 0;
++#else
+ 	is_shark_online = shark_init(NULL) >= 0;
+ 
+ 	// If standard path failed to init we try to init it with ScePiglet path
+ 	if (!is_shark_online) {
+ 		is_shark_online = shark_init("ur0:data/external/libshacccg.suprx") >= 0;
++	}
++#endif
+ #ifdef LOG_ERRORS
+-		if (!is_shark_online)
+-			vgl_log("%s:%d Fatal error: SceShaccCg not found.\n", __FILE__, __LINE__);
++	if (!is_shark_online)
++		vgl_log("%s:%d Fatal error: SceShaccCg not found.\n", __FILE__, __LINE__);
+ #endif
+-	}
+ 
+ 	return is_shark_online;
+ }
+diff --git a/source/vgl.c b/source/vgl.c
+index 014e790..6afba54 100644
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -131,16 +131,25 @@ static uint8_t *circular_data_pool_limit;
+ uint32_t circular_data_pool_size = CIRCULAR_POOL_SIZE_DEF;
+ uint8_t *vgl_reserve_data_pool(uint32_t size) {
+ #ifndef CIRCULAR_POOL_SPEEDHACK
+-	uint8_t *res = circular_data_pool_ptr[vgl_circular_idx];
+-	circular_data_pool_ptr[vgl_circular_idx] += size;
++	// Keep every bump 16-byte aligned. Callers pass odd sizes (index shorts, tight
++	// vertex strides). The next consumer is often glBlitNamedFramebuffer, which
++	// writes positions with NEON (unaligned vst1 is legal) and texcoords with VFP
++	// vstr, and VFP faults on a misaligned address. That is a data abort on a real
++	// Vita (stop 0x30004) and a silent success on Vita3K. The character-select EFB
++	// blit died on vstr s11, [r2, #52] with r2 == 0x70764d0e.
++	uint8_t *cur = circular_data_pool_ptr[vgl_circular_idx];
++	uint8_t *res = (uint8_t *)(((uint32_t)cur + (MEM_ALIGNMENT - 1)) & ~(uint32_t)(MEM_ALIGNMENT - 1));
++	uint32_t step = (size + (MEM_ALIGNMENT - 1)) & ~(uint32_t)(MEM_ALIGNMENT - 1);
++	circular_data_pool_ptr[vgl_circular_idx] = res + step;
+ 	if (circular_data_pool_ptr[vgl_circular_idx] > circular_data_pool_limit[vgl_circular_idx]) {
+-		res = (uint8_t *)gpu_alloc_mapped_for_cpu(size);
++		res = (uint8_t *)gpu_alloc_mapped_for_cpu(step);
+ #ifdef LOG_ERRORS
+ 		if (!res) {
+ 			vgl_log("%s:%d gpu_alloc_mapped_for_cpu failed with a requested size of %u bytes.\n", __FILE__, __LINE__, size);
+ 		}
+ #endif
+-		mark_as_dirty(res);
++		if (res)
++			mark_as_dirty(res);
+ 	}
+ #else
+ #ifdef LOG_ERRORS

@@ -1,0 +1,48 @@
+/build/
+/build-host/
+/build-vita/
+/mariokartwii/
+/Assets/
+/generated/
+/upstream/Assets/
+/upstream/generated/
+/upstream/build/
+/vita-guest-data/
+/ux0-data/
+/cmake-build-*/
+*.vpk
+*.self
+*.velf
+.DS_Store
+.idea/
+.vscode/
+compile_commands.json
+CMakeUserPresets.json
+/third_party/vitaGL/
+/third_party/vitaShaRK/
+/third_party/math-neon/
+/_to_delete/
+/tools/vita-parse-core/.venv/
+
+# Fetched by scripts/fetch-deps.sh (pinned commits + patches/)
+/upstream/
+
+# In-source CMake output
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+CTestTestfile.cmake
+
+# Local captures, dumps and scratch (game textures and screenshots stay out of git)
+/capture_*/
+/coredmps/
+*.psp2dmp
+/Claude outputs/
+__pycache__/
+*.pyc
+watchdog.log
+boot.log
+
+# Local notes kept out of git (old full dev log lives here)
+/local/

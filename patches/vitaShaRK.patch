@@ -1,0 +1,19 @@
+diff --git a/source/vitashark.c b/source/vitashark.c
+index f030bc8..da86b1b 100644
+--- a/source/vitashark.c
++++ b/source/vitashark.c
+@@ -27,7 +27,14 @@
+ #include "xxhash.h"
+ 
+ // Settings
++// Vita3K has no taiHEN SceShaccCgExt. shark_init_simple() is the supported path;
++// stub the Ext symbols so this TU still links when HAVE_VITA3K_SUPPORT is set.
++#ifdef HAVE_VITA3K_SUPPORT
++static void sceShaccCgExtEnableExtensions(void) {}
++static void sceShaccCgExtDisableExtensions(void) {}
++#else
+ #include <shacccg_ext.h>
++#endif
+ 
+ // Default path for SceShaccCg module location
+ #define DEFAULT_SHACCCG_PATH "ur0:/data/libshacccg.suprx"

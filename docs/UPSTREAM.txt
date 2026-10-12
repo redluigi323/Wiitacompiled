@@ -1,0 +1,4 @@
+patchzyy/Wiicompiled
+pin: 7e6604c4157d3a6f937d1a03ac9818fd85bba0a9
+tree: upstream/
+sync: scripts/sync-upstream.sh
